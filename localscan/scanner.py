@@ -7,12 +7,18 @@
 LocalScan — main entry point.
 
 Usage:
-    python scanner.py
+    python scanner.py [--debug] [--quick] [--no-color]
+
+Flags:
+    --debug     Enable verbose logging output to terminal
+    --quick     Skip heavy checks (e.g. full port scan)
+    --no-color  Disable colored terminal output
 
 Runs all security checks, shows live progress in the terminal, and generates
 a timestamped HTML report: report_YYYYMMDD_HHMMSS.html
 """
 
+import argparse
 import ctypes
 import importlib
 import logging
@@ -40,13 +46,58 @@ except ImportError:
     Style = _Stub()  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
+# CLI argument parsing
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="scanner",
+        description="LocalScan — local vulnerability scanner",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose debug logging to terminal",
+    )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Skip heavy checks (e.g. full port scan)",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        dest="no_color",
+        help="Disable colored terminal output",
+    )
+    return parser.parse_args()
+
+
+# Parse args early so logging can respect --debug
+_ARGS = _parse_args()
+
+# Disable color if --no-color or colorama not available
+if _ARGS.no_color or not HAS_COLOR:
+    class _Stub:  # type: ignore[no-redef]
+        def __getattr__(self, _name: str) -> str:
+            return ""
+    Fore = _Stub()   # type: ignore[assignment]
+    Style = _Stub()  # type: ignore[assignment]
+
+# ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scanner.log")
 
+_log_handlers: List[logging.Handler] = [
+    logging.FileHandler(LOG_FILE, encoding="utf-8"),
+]
+if _ARGS.debug:
+    _log_handlers.append(logging.StreamHandler(sys.stderr))
+
 logging.basicConfig(
-    filename=LOG_FILE,
+    handlers=_log_handlers,
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -108,6 +159,8 @@ def _run_module(
     module,
     step: int,
     total: int,
+    quick: bool = False,
+    is_admin: bool = False,
 ) -> List[Dict[str, Any]]:
     """Run a single module and return its findings."""
     _section(f"Running {module_name} checks… ({step}/{total})")
@@ -117,28 +170,43 @@ def _run_module(
     def progress_callback(msg: str) -> None:
         _print_info(msg)
 
-    try:
-        findings = module.run_checks(progress_callback=progress_callback)
-    except Exception as exc:  # noqa: BLE001
+    def _module_error(exc: Exception) -> List[Dict[str, Any]]:
         logger.exception("Module '%s' crashed: %s", module_name, exc)
         _print_fail(f"Module '{module_name}' encountered an error: {exc}")
-        findings = [{
+        return [{
             "name": f"Module Error: {module_name}",
             "severity": "Info",
             "description": f"The module crashed: {exc}",
             "recommendation": "Check scanner.log for the full traceback.",
         }]
 
+    try:
+        findings = module.run_checks(
+            progress_callback=progress_callback,
+            quick=quick,
+            is_admin=is_admin,
+        )
+    except TypeError:
+        # Module does not yet accept keyword arguments — call without extras
+        try:
+            findings = module.run_checks(progress_callback=progress_callback)
+        except Exception as exc:  # noqa: BLE001
+            findings = _module_error(exc)
+    except Exception as exc:  # noqa: BLE001
+        findings = _module_error(exc)
+
     # Print per-finding summary
     for f in findings:
         sev = f.get("severity", "Info")
         name = f.get("name", "")
+        conf = f.get("confidence", "")
+        conf_str = f" [{conf}]" if conf else ""
         if sev in ("Critical", "High"):
-            _print_fail(f"[{sev}] {name}")
+            _print_fail(f"[{sev}{conf_str}] {name}")
         elif sev == "Medium":
-            _print_warn(f"[{sev}] {name}")
+            _print_warn(f"[{sev}{conf_str}] {name}")
         else:
-            _print_pass(f"[{sev}] {name}")
+            _print_pass(f"[{sev}{conf_str}] {name}")
 
     return findings
 
@@ -148,6 +216,8 @@ def _run_module(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    args = _ARGS
+
     print()
     print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}")
     print(f"{Fore.CYAN}  LocalScan — Local Vulnerability Scanner{Style.RESET_ALL}")
@@ -155,15 +225,24 @@ def main() -> None:
     print(f"  Platform : {platform.system()} {platform.release()}")
     print(f"  Python   : {sys.version.split()[0]}")
     print(f"  Time     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if args.quick:
+        print(f"  Mode     : {Fore.YELLOW}QUICK (heavy checks skipped){Style.RESET_ALL}")
+    if args.debug:
+        print(f"  Logging  : {Fore.YELLOW}DEBUG (verbose){Style.RESET_ALL}")
     print()
 
     # Administrator check
-    if _is_admin():
+    is_admin = _is_admin()
+    if is_admin:
         _print_pass("Running with elevated privileges — all checks available.")
     else:
         _print_warn(
             "Not running as Administrator. Some checks may be skipped or incomplete. "
             "Re-run as Administrator for full results."
+        )
+        logger.warning(
+            "LocalScan started without elevated privileges. "
+            "Registry, WMI, and service checks may be incomplete."
         )
 
     # Import modules lazily so that a missing dependency only affects that module
@@ -187,7 +266,14 @@ def main() -> None:
     all_results: Dict[str, List[Dict[str, Any]]] = {}
 
     for step, (module_key, module) in enumerate(modules_to_run, start=1):
-        results = _run_module(module_key.title(), module, step, total_modules)
+        results = _run_module(
+            module_key.title(),
+            module,
+            step,
+            total_modules,
+            quick=args.quick,
+            is_admin=is_admin,
+        )
         all_results[module_key] = results
 
     # Generate report
