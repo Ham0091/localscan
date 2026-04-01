@@ -6,9 +6,11 @@ Checks open ports, dangerous services, firewall status, and unencrypted protocol
 import socket
 import subprocess
 import sys
+import logging
 import concurrent.futures
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 
+logger = logging.getLogger(__name__)
 
 DANGEROUS_PORTS = {
     21: ("FTP", "High", "FTP transmits credentials in plaintext"),
@@ -22,6 +24,40 @@ DANGEROUS_PORTS = {
 
 UNENCRYPTED_PROTOCOLS = {21, 23}
 
+# Ordered severity levels used for downgrade logic
+_SEVERITY_ORDER = ["Critical", "High", "Medium", "Low", "Info"]
+
+# Banner-based service hints: partial string match → service name
+_BANNER_HINTS = {
+    "SSH": "SSH",
+    "FTP": "FTP",
+    "SMTP": "SMTP",
+    "HTTP": "HTTP",
+    "220": "FTP/SMTP",
+    "Redis": "Redis",
+    "MySQL": "MySQL",
+}
+
+
+def _grab_banner(host: str, port: int, timeout: float = 1.0) -> Optional[str]:
+    """Attempt to grab a one-line banner from an open TCP port.
+
+    Returns the banner string on success, or None if unavailable.
+    Never raises — all errors are silently swallowed.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            try:
+                data = sock.recv(256)
+                return data.decode("utf-8", errors="replace").strip()[:200]
+            except (socket.timeout, OSError):
+                return None
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
 
 def _check_port(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
     """Return True if a TCP port is open."""
@@ -32,45 +68,88 @@ def _check_port(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> boo
         return False
 
 
-def _identify_service(port: int) -> str:
-    """Return a best-guess service name for a port."""
+def _identify_service(port: int, banner: Optional[str] = None) -> Tuple[str, str]:
+    """Return (service_name, confidence) for a port.
+
+    Confidence levels:
+      High   — banner confirms the service
+      Medium — well-known port with no banner confirmation
+      Low    — unknown port, guessed from heuristics
+    """
+    # Try banner-based detection first
+    if banner:
+        for hint, svc in _BANNER_HINTS.items():
+            if hint.upper() in banner.upper():
+                return svc, "High"
+
+    # Fall back to known-port heuristics
+    if port in DANGEROUS_PORTS:
+        return DANGEROUS_PORTS[port][0], "Medium"
+
+    # Try OS service database
     try:
-        return socket.getservbyport(port, "tcp")
+        name = socket.getservbyport(port, "tcp")
+        return name, "Medium"
     except OSError:
-        return DANGEROUS_PORTS.get(port, (f"unknown-{port}",))[0]
+        pass
+
+    return f"unknown-{port}", "Low"
 
 
-def scan_open_ports(start: int = 1, end: int = 10000) -> List[int]:
-    """Scan localhost for open TCP ports in the given range."""
-    open_ports = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
-        futures = {executor.submit(_check_port, port): port for port in range(start, end + 1)}
+def _downgrade_severity(severity: str) -> str:
+    """Return the next-lower severity level, or the same level if already at minimum."""
+    try:
+        idx = _SEVERITY_ORDER.index(severity)
+    except ValueError:
+        return "Low"  # Unknown severity — treat conservatively
+    return _SEVERITY_ORDER[min(idx + 1, len(_SEVERITY_ORDER) - 1)]
+
+
+def scan_open_ports(
+    start: int = 1,
+    end: int = 10000,
+    max_workers: int = 100,
+    timeout: float = 0.5,
+) -> List[int]:
+    """Scan localhost for open TCP ports in the given range using a thread pool."""
+    open_ports: List[int] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_check_port, port, "127.0.0.1", timeout): port
+            for port in range(start, end + 1)
+        }
         for future in concurrent.futures.as_completed(futures):
             port = futures[future]
             try:
                 if future.result():
                     open_ports.append(port)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
     return sorted(open_ports)
 
 
-def check_firewall() -> Dict[str, Any]:
+def check_firewall() -> Tuple[Dict[str, Any], Optional[bool]]:
     """
     Check whether the Windows Firewall is enabled for all profiles.
-    Returns a finding dict.
+
+    Returns:
+        (finding_dict, firewall_disabled)
+        firewall_disabled is True if any profile is OFF, False if all are ON,
+        or None if the state could not be determined.
     """
-    finding = {
+    finding: Dict[str, Any] = {
         "name": "Windows Firewall Status",
         "severity": "Info",
         "description": "",
         "recommendation": "",
+        "confidence": "High",
     }
 
     if sys.platform != "win32":
         finding["description"] = "Firewall check skipped — not running on Windows."
         finding["severity"] = "Info"
-        return finding
+        finding["confidence"] = "Low"
+        return finding, None
 
     try:
         result = subprocess.run(
@@ -91,34 +170,55 @@ def check_firewall() -> Dict[str, Any]:
                 "'netsh advfirewall set allprofiles state on' or through "
                 "Windows Defender Firewall settings."
             )
+            return finding, True
         else:
             finding["severity"] = "Info"
             finding["description"] = "Windows Firewall is enabled on all profiles."
             finding["recommendation"] = "No action required."
+            return finding, False
     except FileNotFoundError:
         finding["severity"] = "Info"
+        finding["confidence"] = "Low"
         finding["description"] = "netsh not found — firewall state could not be determined."
         finding["recommendation"] = "Verify firewall status manually."
     except subprocess.TimeoutExpired:
         finding["severity"] = "Info"
+        finding["confidence"] = "Low"
         finding["description"] = "Firewall check timed out."
         finding["recommendation"] = "Verify firewall status manually."
     except Exception as exc:  # noqa: BLE001
+        logger.exception("Firewall check failed: %s", exc)
         finding["severity"] = "Info"
+        finding["confidence"] = "Low"
         finding["description"] = f"Firewall check failed: {exc}"
         finding["recommendation"] = "Verify firewall status manually."
 
-    return finding
+    return finding, None
 
 
-def run_checks(progress_callback=None) -> List[Dict[str, Any]]:
+def run_checks(
+    progress_callback=None,
+    quick: bool = False,
+    is_admin: bool = False,
+) -> List[Dict[str, Any]]:
     """Run all network checks and return a list of finding dicts."""
-    findings = []
+    findings: List[Dict[str, Any]] = []
 
-    # 1. Scan open ports
+    # 1. Firewall check first (result is used for severity escalation)
     if progress_callback:
-        progress_callback("Scanning open ports on localhost (1–10000)…")
-    open_ports = scan_open_ports(1, 10000)
+        progress_callback("Checking Windows Firewall status…")
+    firewall_finding, firewall_disabled = check_firewall()
+    findings.append(firewall_finding)
+
+    # 2. Scan open ports
+    if quick:
+        if progress_callback:
+            progress_callback("Quick mode: scanning well-known ports only (1–1024)…")
+        open_ports = scan_open_ports(1, 1024)
+    else:
+        if progress_callback:
+            progress_callback("Scanning open ports on localhost (1–10000)…")
+        open_ports = scan_open_ports(1, 10000)
 
     # Open port summary finding
     if open_ports:
@@ -130,26 +230,50 @@ def run_checks(progress_callback=None) -> List[Dict[str, Any]]:
                 + ", ".join(str(p) for p in open_ports)
             ),
             "recommendation": "Review each open port and disable services that are not required.",
+            "confidence": "High",
         })
 
-    # 2. Dangerous services
+    # 3. Dangerous services with banner grabbing
     for port in open_ports:
         if port in DANGEROUS_PORTS:
-            svc_name, svc_severity, svc_desc = DANGEROUS_PORTS[port]
+            svc_name, base_severity, svc_desc = DANGEROUS_PORTS[port]
+
+            # Attempt banner grab for confirmation
+            banner = _grab_banner("127.0.0.1", port)
+            _, confidence = _identify_service(port, banner)
+
+            severity = base_severity
+            extra_desc = ""
+
+            # Escalate RDP severity when firewall is also disabled
+            if port == 3389 and firewall_disabled is True:
+                severity = "Critical"
+                extra_desc = (
+                    " ESCALATED: RDP is exposed AND the Windows Firewall is disabled, "
+                    "making this system directly reachable from the network."
+                )
+
+            # Downgrade severity for low-confidence detections
+            if confidence == "Low":
+                severity = _downgrade_severity(severity)
+
+            banner_note = f" Banner: {banner!r}" if banner else ""
             findings.append({
                 "name": f"Dangerous Service Exposed: {svc_name} (port {port})",
-                "severity": svc_severity,
+                "severity": severity,
                 "description": (
-                    f"Port {port} ({svc_name}) is open on localhost. {svc_desc}."
+                    f"Port {port} ({svc_name}) is open on localhost. {svc_desc}.{extra_desc}"
+                    + (f"\n{banner_note}" if banner_note else "")
                 ),
                 "recommendation": (
                     f"Disable or restrict access to {svc_name} (port {port}) "
                     "unless explicitly required, and ensure it is not accessible "
                     "from untrusted networks."
                 ),
+                "confidence": confidence,
             })
 
-    # 3. Unencrypted protocols
+    # 4. Unencrypted protocols
     unencrypted_found = [p for p in open_ports if p in UNENCRYPTED_PROTOCOLS]
     if unencrypted_found:
         names = [DANGEROUS_PORTS[p][0] for p in unencrypted_found]
@@ -165,11 +289,7 @@ def run_checks(progress_callback=None) -> List[Dict[str, Any]]:
                 "Replace FTP with SFTP/FTPS and Telnet with SSH. "
                 "Disable these services immediately."
             ),
+            "confidence": "High",
         })
-
-    # 4. Firewall check
-    if progress_callback:
-        progress_callback("Checking Windows Firewall status…")
-    findings.append(check_firewall())
 
     return findings

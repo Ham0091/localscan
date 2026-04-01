@@ -9,7 +9,7 @@ import stat
 import sys
 import logging
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,58 @@ SCAN_DIRS = [
     Path.home() / "Downloads",
 ]
 
+# Safety limits
+MAX_SCAN_DEPTH = 4          # Maximum directory recursion depth
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — skip files larger than this
+
+
+def _safe_rglob(
+    directory: Path,
+    pattern: str,
+    max_depth: int = MAX_SCAN_DEPTH,
+) -> List[Path]:
+    """
+    Recursively glob *pattern* under *directory* up to *max_depth* levels deep.
+
+    Safety measures applied:
+    - Respects max_depth to prevent unbounded recursion
+    - Skips symbolic links (files and directories)
+    - Skips files larger than MAX_FILE_SIZE
+    - Silently handles PermissionError and other OS errors
+    """
+    results: List[Path] = []
+
+    def _recurse(current: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            for entry in current.iterdir():
+                # Never follow symlinks
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    _recurse(entry, depth + 1)
+                elif entry.is_file():
+                    try:
+                        # Skip oversized files
+                        if entry.stat().st_size > MAX_FILE_SIZE:
+                            continue
+                    except OSError:
+                        continue
+                    # Pattern match (case-insensitive on Windows)
+                    try:
+                        if entry.match(pattern):
+                            results.append(entry)
+                    except Exception:  # noqa: BLE001
+                        pass
+        except PermissionError:
+            pass
+        except OSError as exc:
+            logger.debug("Filesystem scan skipped %s: %s", current, exc)
+
+    _recurse(directory, 0)
+    return results
+
 
 def _check_ssh_permissions() -> List[Dict[str, Any]]:
     """Check whether the ~/.ssh directory has overly permissive access rights."""
@@ -61,6 +113,7 @@ def _check_ssh_permissions() -> List[Dict[str, Any]]:
             "Ensure SSH private keys are passphrase-protected and that "
             "the directory has restricted permissions (700)."
         ),
+        "confidence": "High",
     })
 
     if sys.platform != "win32":
@@ -75,9 +128,12 @@ def _check_ssh_permissions() -> List[Dict[str, Any]]:
                         "Group or other users may be able to read SSH keys."
                     ),
                     "recommendation": "Run 'chmod 700 ~/.ssh' to restrict access.",
+                    "confidence": "High",
                 })
             # Check individual key files
             for key_file in ssh_dir.iterdir():
+                if key_file.is_symlink():
+                    continue
                 if key_file.is_file() and not key_file.name.endswith(".pub"):
                     key_mode = stat.S_IMODE(os.stat(key_file).st_mode)
                     if key_mode & 0o077:
@@ -88,6 +144,7 @@ def _check_ssh_permissions() -> List[Dict[str, Any]]:
                                 f"SSH private key '{key_file}' has permissions {oct(key_mode)}."
                             ),
                             "recommendation": f"Run 'chmod 600 {key_file}' to restrict access.",
+                            "confidence": "High",
                         })
         except Exception as exc:  # noqa: BLE001
             logger.warning("SSH permission check failed: %s", exc)
@@ -103,17 +160,17 @@ def _scan_credential_files() -> List[Dict[str, Any]]:
     for scan_dir in SCAN_DIRS:
         if not scan_dir.exists():
             continue
+        if scan_dir.is_symlink():
+            continue
         for pattern in CREDENTIAL_PATTERNS:
             try:
-                matched = list(scan_dir.rglob(pattern))
+                matched = _safe_rglob(scan_dir, pattern, max_depth=MAX_SCAN_DEPTH)
                 flagged_files.extend(matched)
-            except PermissionError:
-                pass
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Filesystem scan error in %s pattern %s: %s", scan_dir, pattern, exc)
 
     # Deduplicate
-    seen = set()
+    seen: Set[Path] = set()
     unique_files = []
     for f in flagged_files:
         if f not in seen:
@@ -136,6 +193,7 @@ def _scan_credential_files() -> List[Dict[str, Any]]:
                 "Review these files and remove any plaintext credentials. "
                 "Use a password manager or secrets vault instead."
             ),
+            "confidence": "Medium",
         })
 
     return findings
@@ -149,7 +207,10 @@ def _check_pem_key_files() -> List[Dict[str, Any]]:
 
     for pattern in ("*.pem", "*.key"):
         try:
-            pem_files.extend(home.glob(pattern))
+            pem_files.extend(
+                p for p in home.glob(pattern)
+                if not p.is_symlink() and p.is_file()
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("PEM/key file search failed: %s", exc)
 
@@ -165,6 +226,7 @@ def _check_pem_key_files() -> List[Dict[str, Any]]:
                 "Store private keys in a secure location with restricted permissions "
                 "(e.g., ~/.ssh/ with chmod 600). Verify these files are necessary."
             ),
+            "confidence": "High",
         })
 
     return findings
@@ -177,6 +239,8 @@ def _check_browser_databases() -> List[Dict[str, Any]]:
     for browser, paths in BROWSER_DB_PATHS.items():
         for db_path in paths:
             try:
+                if db_path.is_symlink():
+                    continue
                 if db_path.exists():
                     findings.append({
                         "name": f"{browser} Password Database Detected",
@@ -190,6 +254,7 @@ def _check_browser_databases() -> List[Dict[str, Any]]:
                             "Use a dedicated password manager and enable browser sync "
                             "with a strong master password."
                         ),
+                        "confidence": "High",
                     })
                     break  # One finding per browser is enough
             except PermissionError:
@@ -204,7 +269,11 @@ def _check_browser_databases() -> List[Dict[str, Any]]:
 # Aggregate
 # ---------------------------------------------------------------------------
 
-def run_checks(progress_callback=None) -> List[Dict[str, Any]]:
+def run_checks(
+    progress_callback=None,
+    quick: bool = False,
+    is_admin: bool = False,
+) -> List[Dict[str, Any]]:
     """Run all filesystem checks and return findings."""
     findings = []
 
@@ -227,6 +296,7 @@ def run_checks(progress_callback=None) -> List[Dict[str, Any]]:
                 "severity": "Info",
                 "description": f"An error occurred: {exc}",
                 "recommendation": "Check scanner.log for details.",
+                "confidence": "Low",
             })
 
     if not findings:
@@ -235,6 +305,7 @@ def run_checks(progress_callback=None) -> List[Dict[str, Any]]:
             "severity": "Info",
             "description": "No significant filesystem security issues were detected.",
             "recommendation": "No action required.",
+            "confidence": "High",
         })
 
     return findings

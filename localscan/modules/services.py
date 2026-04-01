@@ -308,7 +308,11 @@ def check_startup_programs() -> List[Dict[str, Any]]:
 # Aggregate
 # ---------------------------------------------------------------------------
 
-def run_checks(progress_callback=None) -> List[Dict[str, Any]]:
+def run_checks(
+    progress_callback=None,
+    quick: bool = False,
+    is_admin: bool = False,
+) -> List[Dict[str, Any]]:
     """Run all services checks and return findings."""
     findings = []
 

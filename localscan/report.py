@@ -106,10 +106,13 @@ def _findings_table(findings: List[Dict[str, Any]]) -> str:
     for f in findings:
         sev = f.get("severity", "Info")
         color = SEVERITY_COLORS.get(sev, SEVERITY_COLORS["Info"])
+        confidence = f.get("confidence", "")
+        conf_cell = f"<td class='conf'>{_h(confidence)}</td>" if confidence else "<td class='conf'>—</td>"
         rows.append(
             f"<tr>"
             f"<td><span class='badge' style='background:{color}'>{_h(sev)}</span></td>"
             f"<td>{_h(f.get('name', ''))}</td>"
+            f"{conf_cell}"
             f"<td class='desc'>{_h(f.get('description', ''))}</td>"
             f"<td class='rec'>{_h(f.get('recommendation', ''))}</td>"
             f"</tr>"
@@ -118,7 +121,8 @@ def _findings_table(findings: List[Dict[str, Any]]) -> str:
     return (
         "<table>"
         "<thead><tr>"
-        "<th>Severity</th><th>Finding</th><th>Description</th><th>Recommendation</th>"
+        "<th>Severity</th><th>Finding</th><th>Confidence</th>"
+        "<th>Description</th><th>Recommendation</th>"
         "</tr></thead>"
         "<tbody>" + "".join(rows) + "</tbody>"
         "</table>"

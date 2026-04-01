@@ -527,7 +527,11 @@ def check_running_services() -> List[Dict[str, Any]]:
 # Aggregate
 # ---------------------------------------------------------------------------
 
-def run_checks(progress_callback=None) -> List[Dict[str, Any]]:
+def run_checks(
+    progress_callback=None,
+    quick: bool = False,
+    is_admin: bool = False,
+) -> List[Dict[str, Any]]:
     """Run all system checks and return findings."""
     findings = []
     checks = [
