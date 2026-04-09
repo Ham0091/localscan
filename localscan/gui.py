@@ -32,6 +32,8 @@ from typing import Optional
 from PySide6.QtCore import (
     Qt,
     QSize,
+    QTimer,
+    Property,
     QPropertyAnimation,
     QEasingCurve,
     QThread,
@@ -213,29 +215,59 @@ def _card(parent: Optional[QWidget] = None) -> QFrame:
 # ---------------------------------------------------------------------------
 
 class RiskGauge(QWidget):
-    """Semi-circular arc gauge showing a 0-100 risk score."""
+    """Semi-circular arc gauge showing a 0-100 risk score with zone bands."""
+
+    # Zone definitions: (start_pct, end_pct, color)
+    _ZONES = [
+        (0,  20,  "#3b82f6"),   # blue  — low risk
+        (20, 50,  "#eab308"),   # yellow — medium risk
+        (50, 100, "#ef4444"),   # red   — high risk
+    ]
+    _ZONE_DIM_ALPHA = 45        # opacity for background zone bands
+    _TRACK_COLOR    = "#1e1e36"
 
     def __init__(self, score: int = 0, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self._score = max(0, min(100, score))
+        self._score = 0.0       # animated property value
+        self._target = max(0, min(100, score))
         self.setMinimumSize(180, 120)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
+        # Animation
+        self._anim = QPropertyAnimation(self, b"animatedScore")
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.setDuration(800)
+        if self._target:
+            self.set_score(self._target)
 
-    def set_score(self, score: int) -> None:
-        self._score = max(0, min(100, score))
+    # ── Qt property for animation ─────────────────────────────────
+    def _get_animated_score(self) -> float:
+        return self._score
+
+    def _set_animated_score(self, val: float) -> None:
+        self._score = val
         self.update()
 
-    def _score_color(self) -> QColor:
-        if self._score >= 70:
-            return QColor(Palette.CRITICAL)
-        if self._score >= 40:
-            return QColor(Palette.HIGH)
-        if self._score >= 20:
-            return QColor(Palette.MEDIUM)
-        return QColor(Palette.LOW)
+    animatedScore = Property(float, _get_animated_score, _set_animated_score)
 
+    # ── Public API ────────────────────────────────────────────────
+    def set_score(self, score: int) -> None:
+        target = max(0.0, min(100.0, float(score)))
+        self._anim.stop()
+        self._anim.setStartValue(self._score)
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    def _needle_color(self) -> QColor:
+        s = self._score
+        if s > 50:
+            return QColor("#ef4444")
+        if s > 20:
+            return QColor("#eab308")
+        return QColor("#3b82f6")
+
+    # ── Painting ──────────────────────────────────────────────────
     def paintEvent(self, _event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -249,19 +281,34 @@ class RiskGauge(QWidget):
         rect_y = cy - radius
         rect_side = radius * 2
 
-        # Background arc (track)
-        pen = QPen(QColor(Palette.BORDER_LT))
+        # 1) Full track (dark background)
+        pen = QPen(QColor(self._TRACK_COLOR))
         pen.setWidth(int(arc_w))
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
         painter.setPen(pen)
         painter.drawArc(
             int(rect_x), int(rect_y), int(rect_side), int(rect_side),
             180 * 16, -180 * 16,
         )
 
-        # Filled arc (score)
-        if self._score > 0:
-            pen2 = QPen(self._score_color())
+        # 2) Zone bands (semi-transparent colored segments)
+        for z_start, z_end, z_color in self._ZONES:
+            c = QColor(z_color)
+            c.setAlpha(self._ZONE_DIM_ALPHA)
+            pen_z = QPen(c)
+            pen_z.setWidth(int(arc_w))
+            pen_z.setCapStyle(Qt.PenCapStyle.FlatCap)
+            painter.setPen(pen_z)
+            start_angle = int(180 * 16 - (z_start / 100) * 180 * 16)
+            span_angle  = int(-((z_end - z_start) / 100) * 180 * 16)
+            painter.drawArc(
+                int(rect_x), int(rect_y), int(rect_side), int(rect_side),
+                start_angle, span_angle,
+            )
+
+        # 3) Filled arc up to current score
+        if self._score > 0.5:
+            pen2 = QPen(self._needle_color())
             pen2.setWidth(int(arc_w))
             pen2.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen2)
@@ -272,11 +319,8 @@ class RiskGauge(QWidget):
                 180 * 16, span,
             )
 
-        # Score number — optically centred in the arc bowl
-        # The arc spans 180° from 9 o'clock to 3 o'clock; its visual
-        # centre is at cy-0.10*radius.  We nudge the text block upward
-        # slightly so the number sits in the optical middle of the bowl.
-        painter.setPen(QPen(self._score_color()))
+        # 4) Score number
+        painter.setPen(QPen(self._needle_color()))
         font = QFont()
         font.setBold(True)
         font.setPointSize(int(radius * 0.40))
@@ -287,10 +331,10 @@ class RiskGauge(QWidget):
             int(cx - radius), score_block_top,
             int(radius * 2), score_block_h,
             Qt.AlignmentFlag.AlignCenter,
-            str(self._score),
+            str(int(round(self._score))),
         )
 
-        # Label — sits just below the number, inside the arc opening
+        # 5) Label
         painter.setPen(QPen(QColor(Palette.TEXT_SECONDARY)))
         font2 = QFont()
         font2.setPointSize(int(radius * 0.14))
@@ -573,6 +617,246 @@ class DashboardPage(QScrollArea):
         self.gauge.set_score(score)
         for label, card in self._sev_cards.items():
             card.set_count(counts.get(label, 0))
+
+
+# ---------------------------------------------------------------------------
+# Finding card — collapsible card for a single scan finding
+# ---------------------------------------------------------------------------
+
+_SEV_BADGE = {
+    "Critical": (Palette.CRITICAL, "#1a0505"),
+    "High":     (Palette.HIGH,     "#1a0e05"),
+    "Medium":   (Palette.MEDIUM,   "#1a1505"),
+    "Low":      (Palette.LOW,      "#051a0a"),
+    "Info":     (Palette.ACCENT_LITE, Palette.BG_CARD),
+}
+
+
+class FindingCard(QFrame):
+    """Collapsible card displaying a single finding."""
+
+    def __init__(
+        self,
+        finding: dict,
+        module_name: str = "",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._expanded = False
+        self._finding = finding
+
+        sev = finding.get("severity", "Info")
+        name = finding.get("name", "Unknown Finding")
+        desc = finding.get("description", "")
+        rec = finding.get("recommendation", "")
+        conf = finding.get("confidence", "")
+        evidence = finding.get("evidence", "")
+
+        fg, bg = _SEV_BADGE.get(sev, _SEV_BADGE["Info"])
+
+        self.setStyleSheet(f"""
+            FindingCard {{
+                background: {Palette.BG_CARD};
+                border: 1px solid {Palette.BORDER};
+                border-radius: 8px;
+            }}
+            FindingCard:hover {{
+                border-color: {Palette.BORDER_LT};
+            }}
+        """)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Header row ────────────────────────────────────────────
+        header = QWidget()
+        header.setStyleSheet("background: transparent; border: none;")
+        h_lay = QHBoxLayout(header)
+        h_lay.setContentsMargins(16, 12, 16, 12)
+        h_lay.setSpacing(10)
+
+        # Expand indicator
+        self._arrow = _label("▸", size=11, color=Palette.TEXT_MUTED)
+        self._arrow.setFixedWidth(14)
+        h_lay.addWidget(self._arrow)
+
+        # Severity badge
+        badge = QLabel(sev.upper())
+        badge.setFixedHeight(22)
+        badge.setStyleSheet(f"""
+            QLabel {{
+                background: {bg};
+                color: {fg};
+                border: 1px solid {fg};
+                border-radius: 4px;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.8px;
+                padding: 0 8px;
+            }}
+        """)
+        h_lay.addWidget(badge)
+
+        # Title
+        title_lbl = _label(name, size=13, bold=True)
+        title_lbl.setStyleSheet(f"color: {Palette.TEXT_PRIMARY}; background: transparent; border: none;")
+        h_lay.addWidget(title_lbl, 1)
+
+        # Module chip
+        if module_name:
+            mod_lbl = _label(module_name, size=10, color=Palette.TEXT_SECONDARY)
+            mod_lbl.setStyleSheet(
+                f"color: {Palette.TEXT_SECONDARY}; background: {Palette.BG_PANEL}; "
+                f"border: 1px solid {Palette.BORDER}; border-radius: 4px; "
+                "padding: 2px 8px; font-size: 10px;"
+            )
+            h_lay.addWidget(mod_lbl)
+
+        # Confidence chip
+        if conf:
+            conf_lbl = _label(conf, size=10, color=Palette.TEXT_MUTED)
+            conf_lbl.setStyleSheet(
+                f"color: {Palette.TEXT_MUTED}; background: transparent; "
+                "border: none; font-size: 10px;"
+            )
+            h_lay.addWidget(conf_lbl)
+
+        root.addWidget(header)
+
+        # ── Body (hidden by default) ──────────────────────────────
+        self._body = QWidget()
+        self._body.setVisible(False)
+        self._body.setStyleSheet(f"""
+            QWidget {{
+                background: transparent;
+                border: none;
+                border-top: 1px solid {Palette.BORDER};
+            }}
+        """)
+        b_lay = QVBoxLayout(self._body)
+        b_lay.setContentsMargins(42, 12, 16, 16)
+        b_lay.setSpacing(8)
+
+        if desc:
+            b_lay.addWidget(self._detail_block("DESCRIPTION", desc))
+        if rec:
+            b_lay.addWidget(self._detail_block("REMEDIATION", rec))
+        if evidence:
+            b_lay.addWidget(self._detail_block("EVIDENCE", str(evidence), mono=True))
+
+        root.addWidget(self._body)
+
+    @staticmethod
+    def _detail_block(heading: str, text: str, mono: bool = False) -> QWidget:
+        w = QWidget()
+        w.setStyleSheet("background: transparent; border: none;")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        h = _label(heading, size=10, color=Palette.TEXT_MUTED, bold=True)
+        h.setStyleSheet(
+            f"color: {Palette.TEXT_MUTED}; font-size: 10px; font-weight: 700; "
+            "letter-spacing: 1.2px; background: transparent; border: none;"
+        )
+        lay.addWidget(h)
+
+        body = QLabel(text)
+        body.setWordWrap(True)
+        font_family = (
+            '"JetBrains Mono", "Cascadia Code", Consolas, monospace'
+            if mono
+            else ""
+        )
+        body.setStyleSheet(
+            f"color: {Palette.TEXT_PRIMARY}; font-size: 12px; "
+            f"line-height: 1.4; background: transparent; border: none;"
+            + (f" font-family: {font_family};" if font_family else "")
+        )
+        lay.addWidget(body)
+        return w
+
+    def mousePressEvent(self, _event) -> None:  # noqa: N802
+        self._expanded = not self._expanded
+        self._body.setVisible(self._expanded)
+        self._arrow.setText("▾" if self._expanded else "▸")
+
+
+# ---------------------------------------------------------------------------
+# Findings page — scrollable list of FindingCards for one module
+# ---------------------------------------------------------------------------
+
+class FindingsPage(QScrollArea):
+    """Scrollable page that displays FindingCards for a scan module."""
+
+    def __init__(
+        self,
+        title: str,
+        placeholder_text: str = "Run a scan to see findings.",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._title_text = title
+        self._placeholder_text = placeholder_text
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet("background: transparent;")
+
+        self._container = QWidget()
+        self._container.setStyleSheet("background: transparent;")
+        self.setWidget(self._container)
+
+        self._layout = QVBoxLayout(self._container)
+        self._layout.setContentsMargins(28, 28, 28, 28)
+        self._layout.setSpacing(12)
+
+        self._title_lbl = _label(title, size=20, bold=True)
+        self._layout.addWidget(self._title_lbl)
+
+        self._count_lbl = _label("", size=12, color=Palette.TEXT_SECONDARY)
+        self._layout.addWidget(self._count_lbl)
+
+        self._placeholder = _label(
+            placeholder_text, size=13, color=Palette.TEXT_MUTED,
+        )
+        self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._layout.addWidget(self._placeholder)
+
+        self._layout.addStretch()
+
+    def set_findings(self, findings: list, module_name: str = "") -> None:
+        """Replace current cards with new findings."""
+        # Remove old cards (keep title, count, placeholder, stretch)
+        while self._layout.count() > 4:
+            item = self._layout.takeAt(3)  # position after count_lbl
+            if item.widget():
+                item.widget().deleteLater()
+
+        if findings:
+            self._placeholder.setVisible(False)
+            self._count_lbl.setText(f"{len(findings)} finding{'s' if len(findings) != 1 else ''}")
+            # Insert cards before the stretch
+            insert_pos = 3
+            for f in findings:
+                card = FindingCard(f, module_name=module_name)
+                self._layout.insertWidget(insert_pos, card)
+                insert_pos += 1
+        else:
+            self._placeholder.setVisible(True)
+            self._placeholder.setText("No findings for this module.")
+            self._count_lbl.setText("")
+
+    def clear_findings(self) -> None:
+        """Reset to placeholder state."""
+        while self._layout.count() > 4:
+            item = self._layout.takeAt(3)
+            if item.widget():
+                item.widget().deleteLater()
+        self._placeholder.setVisible(True)
+        self._placeholder.setText(self._placeholder_text)
+        self._count_lbl.setText("")
 
 
 # ---------------------------------------------------------------------------
@@ -1072,14 +1356,23 @@ class MainWindow(QMainWindow):
         self.dashboard_page = DashboardPage()
         self.stack.addWidget(self.dashboard_page)
 
-        page_defs = [
-            ("Network",    "⬡", "Network check results will appear here after a scan."),
-            ("System",     "⬡", "System check results will appear here after a scan."),
-            ("Filesystem", "⬡", "Filesystem check results will appear here after a scan."),
-            ("Services",   "⬡", "Services & persistence check results will appear here after a scan."),
-        ]
-        for title, icon, desc in page_defs:
-            self.stack.addWidget(PlaceholderPage(title, icon, desc))
+        # Module findings pages (indices 1-4)
+        self.network_page    = FindingsPage("Network",    "Network check results will appear here after a scan.")
+        self.system_page     = FindingsPage("System",     "System check results will appear here after a scan.")
+        self.filesystem_page = FindingsPage("Filesystem", "Filesystem check results will appear here after a scan.")
+        self.services_page   = FindingsPage("Services",   "Services & persistence check results will appear here after a scan.")
+        self.stack.addWidget(self.network_page)     # index 1
+        self.stack.addWidget(self.system_page)      # index 2
+        self.stack.addWidget(self.filesystem_page)  # index 3
+        self.stack.addWidget(self.services_page)    # index 4
+
+        # Module key -> page mapping for scan result routing
+        self._module_pages = {
+            "network":    self.network_page,
+            "system":     self.system_page,
+            "filesystem": self.filesystem_page,
+            "services":   self.services_page,
+        }
 
         self.reports_page = ReportsPage()
         self.stack.addWidget(self.reports_page)  # index 5
@@ -1237,6 +1530,21 @@ class MainWindow(QMainWindow):
         total_findings = sum(len(v) for v in results.values())
         self.log_console.append_line("SCAN", f"Scan complete — {total_findings} findings across {len(results)} modules.")
 
+        # Populate module findings pages
+        for module_key, findings in results.items():
+            page = self._module_pages.get(module_key)
+            if page is not None:
+                page.set_findings(findings, module_name=module_key.title())
+
+        # Update dashboard gauge with risk score
+        try:
+            from localscan.report import calculate_risk_score
+            all_findings = [f for fl in results.values() for f in fl]
+            score = calculate_risk_score(all_findings)
+            self.dashboard_page.gauge.set_score(score)
+        except Exception:
+            pass
+
         if self.header.report_toggle.isChecked():
             self.log_console.append_line("OK", "HTML report saved to localscan/reports/.")
             self.reports_page.refresh()
@@ -1254,6 +1562,180 @@ class MainWindow(QMainWindow):
         self.log_console.append_line("INFO",  f"Python {sys.version.split()[0]}")
         self.log_console.append_line("OK",    "All modules imported successfully.")
         self.log_console.append_line("INFO",  "Press  ▶ Run Scan  to begin a local security scan.")
+
+
+# ---------------------------------------------------------------------------
+# Splash screen
+# ---------------------------------------------------------------------------
+
+class SplashScreen(QWidget):
+    """Dark splash with radar-pulse animation, progress bar, and status text."""
+
+    _MESSAGES = [
+        "Initializing LocalScan Engine...",
+        "Detecting OS...",
+        "Checking Privileges...",
+        "Loading Modules...",
+    ]
+
+    finished = Signal()  # emitted when the splash sequence is done
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(420, 320)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.SplashScreen
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setStyleSheet(f"background: {Palette.BG_DEEP};")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(40, 36, 40, 32)
+        layout.setSpacing(0)
+
+        # Shield / radar icon area
+        self._pulse_angle = 0.0
+        self._pulse_widget = QWidget()
+        self._pulse_widget.setFixedSize(120, 120)
+        self._pulse_widget.setStyleSheet("background: transparent;")
+        layout.addWidget(self._pulse_widget, 0, Qt.AlignmentFlag.AlignCenter)
+
+        layout.addSpacing(16)
+
+        # Title
+        title = _label("LocalScan", size=18, bold=True)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet(f"color: {Palette.TEXT_PRIMARY}; background: transparent;")
+        layout.addWidget(title)
+
+        layout.addSpacing(20)
+
+        # Status text
+        self._status = _label(self._MESSAGES[0], size=11, color=Palette.TEXT_SECONDARY)
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status.setStyleSheet(
+            f"color: {Palette.TEXT_SECONDARY}; background: transparent; "
+            "letter-spacing: 0.6px;"
+        )
+        layout.addWidget(self._status)
+
+        layout.addSpacing(14)
+
+        # Progress bar
+        self._bar_bg = QWidget()
+        self._bar_bg.setFixedHeight(4)
+        self._bar_bg.setStyleSheet(
+            f"background: {Palette.BORDER}; border-radius: 2px;"
+        )
+        layout.addWidget(self._bar_bg)
+
+        self._bar_fill = QWidget(self._bar_bg)
+        self._bar_fill.setFixedHeight(4)
+        self._bar_fill.setStyleSheet(
+            f"background: {Palette.ACCENT}; border-radius: 2px;"
+        )
+        self._bar_fill.setFixedWidth(0)
+
+        layout.addStretch()
+
+        # State
+        self._step = 0
+        self._progress = 0.0
+
+        # Pulse animation timer (radar sweep)
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(30)
+        self._pulse_timer.timeout.connect(self._tick_pulse)
+
+        # Step timer — advance message every 400ms
+        self._step_timer = QTimer(self)
+        self._step_timer.setInterval(400)
+        self._step_timer.timeout.connect(self._advance)
+
+    # ── Start / stop ──────────────────────────────────────────────
+    def begin(self) -> None:
+        self.show()
+        self._center_on_screen()
+        self._pulse_timer.start()
+        self._step_timer.start()
+
+    def _center_on_screen(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen:
+            geo = screen.availableGeometry()
+            self.move(
+                geo.x() + (geo.width() - self.width()) // 2,
+                geo.y() + (geo.height() - self.height()) // 2,
+            )
+
+    # ── Timers ────────────────────────────────────────────────────
+    def _tick_pulse(self) -> None:
+        self._pulse_angle = (self._pulse_angle + 3) % 360
+        self._pulse_widget.update()
+        self.update()  # trigger paintEvent for the radar
+
+    def _advance(self) -> None:
+        self._step += 1
+        total = len(self._MESSAGES)
+        if self._step < total:
+            self._status.setText(self._MESSAGES[self._step])
+            frac = self._step / total
+            self._bar_fill.setFixedWidth(int(self._bar_bg.width() * frac))
+        else:
+            self._bar_fill.setFixedWidth(self._bar_bg.width())
+            self._status.setText("Ready.")
+            self._step_timer.stop()
+            self._pulse_timer.stop()
+            QTimer.singleShot(300, self._finish)
+
+    def _finish(self) -> None:
+        self.finished.emit()
+        self.close()
+
+    # ── Paint: radar pulse rings ──────────────────────────────────
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Map pulse widget position to self coords
+        pw = self._pulse_widget
+        cx = pw.x() + pw.width() / 2
+        cy = pw.y() + pw.height() / 2
+        max_r = pw.width() / 2
+
+        # Concentric rings (static, dim)
+        for i in range(1, 4):
+            r = max_r * i / 3
+            c = QColor(Palette.BORDER_LT)
+            c.setAlpha(40 + i * 10)
+            pen = QPen(c)
+            pen.setWidthF(1.0)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(int(cx - r), int(cy - r), int(r * 2), int(r * 2))
+
+        # Sweep wedge
+        sweep_color = QColor(Palette.ACCENT)
+        sweep_color.setAlpha(50)
+        grad = QConicalGradient(cx, cy, -self._pulse_angle)
+        grad.setColorAt(0.0, sweep_color)
+        t = QColor(Palette.ACCENT)
+        t.setAlpha(0)
+        grad.setColorAt(0.15, t)
+        grad.setColorAt(1.0, t)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(grad))
+        painter.drawEllipse(int(cx - max_r), int(cy - max_r), int(max_r * 2), int(max_r * 2))
+
+        # Centre dot
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(Palette.ACCENT))
+        painter.drawEllipse(int(cx - 3), int(cy - 3), 6, 6)
+
+        painter.end()
 
 
 # ---------------------------------------------------------------------------
@@ -1301,8 +1783,14 @@ def main() -> None:
     _apply_dark_palette(app)
     app.setStyleSheet(STYLESHEET)
 
+    splash = SplashScreen()
     window = MainWindow()
-    window.show()
+
+    def _on_splash_done() -> None:
+        window.show()
+
+    splash.finished.connect(_on_splash_done)
+    splash.begin()
 
     sys.exit(app.exec())
 
