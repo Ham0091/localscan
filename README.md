@@ -1,65 +1,168 @@
-# localscan
+# LocalScan
 
-A standalone Python CLI tool that scans a Windows system for common local security vulnerabilities and generates a self-contained HTML report.
+A lightweight local security posture scanner for Windows that checks common host-level misconfigurations, exposed local services, risky files, startup persistence, and basic hardening indicators.
 
-## Setup
+---
 
-**Requirements:** Python 3.8 or later on Windows (most checks degrade gracefully on macOS/Linux).
+## Overview
 
-```
-cd localscan
-pip install -r requirements.txt
-python scanner.py
-```
+LocalScan performs local host inspection and generates an HTML security report with severity-based findings.
 
-Run as Administrator for full results — some checks (registry reads, SMB state, service enumeration) require elevated privileges.
+It is designed for:
 
-## What it checks
+* educational security auditing
+* local hardening review
+* rapid host hygiene checks
+* demonstrating modular vulnerability scanning architecture
 
-**Network**
-- Open TCP ports on localhost (1–10000)
-- Dangerous services exposed: Telnet, FTP, RDP, SMB, VNC, MySQL, Redis
-- Windows Firewall status across all profiles
-- Unencrypted protocols (Telnet, FTP) running locally
+This tool does **not** perform remote exploitation, packet interception, or vulnerability database correlation.
 
-**System**
-- Windows version and patch level
-- Windows Defender status and definition age
-- Windows Update configuration
-- User Account Control (UAC) state
-- Guest account status
-- Auto-login configuration
-- PowerShell execution policy
-- SMB v1 (EternalBlue/WannaCry attack surface)
-- Remote Desktop Protocol state
-- Running services — flags known risky ones
+---
 
-**Filesystem**
-- Potential plaintext credential files in Desktop, Documents, Downloads
-- SSH directory permissions
-- Private key and certificate files in the home directory
-- Browser password database existence (Chrome, Firefox, Edge — contents never read)
+## Current Scan Coverage
 
-**Services and Software**
-- Installed versions of Java, Adobe Reader, VLC, 7-Zip, Chrome, Firefox
-- Scheduled tasks containing suspicious patterns
-- Startup registry entries containing suspicious patterns
+### Network Checks
+
+* local TCP port scan
+* dangerous service detection
+* firewall status check
+* insecure protocol detection
+* service banner collection
+
+### System Checks
+
+* User Account Control (UAC)
+* Windows Defender status
+* Windows Update policy
+* Remote Desktop configuration
+* Guest account status
+* PowerShell execution policy
+* SMBv1 detection
+* running service inspection
+
+### Filesystem Checks
+
+* credential-pattern file discovery
+* PEM / key file detection
+* browser credential database presence
+* SSH file permission review
+
+### Services & Persistence Checks
+
+* startup registry entries
+* scheduled task inspection
+* installed software inventory
+* common risky software detection
+
+---
 
 ## Output
 
-The scanner writes a timestamped HTML report (`report_YYYYMMDD_HHMMSS.html`) to the same directory and opens it in the default browser. A log file (`scanner.log`) captures errors and debug output.
+LocalScan generates:
 
-## Risk scoring
+* HTML security report
+* severity summary
+* risk score
+* timestamped scan output
 
-| Severity | Points each | Cap |
-|----------|-------------|-----|
-| Critical | 20          | 40  |
-| High     | 10          | 30  |
-| Medium   | 5           | 20  |
-| Low      | 2           | 10  |
+---
 
-Total is capped at 100.
+## Project Structure
 
-## Disclaimer
+```text
+localscan/
+├── scanner.py
+├── report.py
+├── modules/
+│   ├── __init__.py
+│   ├── network.py
+│   ├── system.py
+│   ├── filesystem.py
+│   └── services.py
+```
 
-This tool is intended for educational use on systems you own or have explicit written permission to scan. Do not use it on systems you do not control. The authors accept no liability for misuse.
+---
+
+## Installation
+
+```bash
+git clone https://github.com/Ham0091/localscan.git
+cd localscan
+pip install -r requirements.txt
+```
+
+---
+
+## Run
+
+Recommended:
+
+```bash
+python -m localscan.scanner
+```
+
+If using package entrypoint:
+
+```bash
+python scanner.py
+```
+
+(Depends on final package structure.)
+
+---
+
+## Requirements
+
+* Python 3.10+
+* Windows 10 / 11
+* Administrator privileges recommended
+
+---
+
+## Important Scope Notes
+
+LocalScan currently focuses on **local host hygiene**, not full enterprise hardening.
+
+Current limitations include:
+
+* loopback-based port checks only
+* Windows-first implementation
+* limited version intelligence
+* no CVE feed integration
+* no BitLocker / Secure Boot / LSASS coverage yet
+
+---
+
+## Planned Improvements
+
+* stronger Windows hardening checks
+* listener binding analysis
+* improved software version intelligence
+* safer risk scoring model
+* better macOS support
+* module result schema validation
+
+---
+
+## Report Philosophy
+
+Findings are grouped by severity:
+
+* Critical
+* High
+* Medium
+* Low
+
+Risk score is intended as a quick indicator and should be interpreted together with severity counts.
+
+---
+
+## Educational Use
+
+This project is intended for learning modular scanner design, local enumeration techniques, and security reporting workflows.
+
+---
+
+## License
+
+Add a LICENSE file before production distribution.

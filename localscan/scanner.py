@@ -30,6 +30,15 @@ import webbrowser
 from datetime import datetime
 from typing import Dict, List, Any
 
+# ---------------------------------------------------------------------------
+# Package path bootstrap — ensures "localscan.*" imports resolve whether this
+# file is run directly (python localscan/scanner.py) or as a module
+# (python -m localscan.scanner).
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 try:
     import colorama
     from colorama import Fore, Style
