@@ -1,16 +1,21 @@
 """
 Services security checks for LocalScan.
 Checks installed software versions, suspicious scheduled tasks,
-and startup program entries.
+and startup program entries on both Windows and macOS.
 """
 
+import platform
+import plistlib
 import subprocess
 import sys
 import logging
 import re
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+PLATFORM = platform.system().lower()
 
 # ---------------------------------------------------------------------------
 # Software version detection via registry
@@ -62,18 +67,107 @@ def _get_installed_software_windows() -> List[Dict[str, str]]:
         except Exception:  # noqa: BLE001
             pass
 
+    # Also enumerate HKCU uninstall root
+    hkcu_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, hkcu_path) as base_key:
+            subkey_count, _, _ = winreg.QueryInfoKey(base_key)
+            for i in range(subkey_count):
+                try:
+                    subkey_name = winreg.EnumKey(base_key, i)
+                    with winreg.OpenKey(base_key, subkey_name) as subkey:
+                        try:
+                            name, _ = winreg.QueryValueEx(subkey, "DisplayName")
+                            version, _ = winreg.QueryValueEx(subkey, "DisplayVersion")
+                            software.append({"name": str(name), "version": str(version)})
+                        except FileNotFoundError:
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        pass
+
     return software
+
+
+def _version_key(v: str):
+    """Parse a version string into a list of ints for comparison."""
+    try:
+        return [int(x) for x in v.split(".") if x.isdigit()]
+    except Exception:
+        return [0]
 
 
 def check_software_versions() -> List[Dict[str, Any]]:
     """Detect installed versions of known software and flag them for review."""
     findings = []
 
+    if PLATFORM == "darwin":
+        apps_to_find = {
+            "Google Chrome.app": "Google Chrome",
+            "Firefox.app": "Mozilla Firefox",
+            "VLC.app": "VLC Media Player",
+            "LibreOffice.app": "LibreOffice",
+            "zoom.us.app": "Zoom",
+            "Microsoft Word.app": "Microsoft Word",
+            "Microsoft Excel.app": "Microsoft Excel",
+        }
+        for app_filename, friendly_name in apps_to_find.items():
+            app_path = Path("/Applications") / app_filename
+            plist_path = app_path / "Contents" / "Info.plist"
+            if not app_path.exists():
+                continue
+            try:
+                with open(plist_path, "rb") as f:
+                    plist = plistlib.load(f)
+                version = plist.get(
+                    "CFBundleShortVersionString", "Unknown"
+                )
+                findings.append({
+                    "name": (
+                        f"Installed Software Detected: "
+                        f"{friendly_name} v{version}"
+                    ),
+                    "severity": "Low",
+                    "description": (
+                        f"{friendly_name} version {version} is installed. "
+                        "Automated update status could not be verified."
+                    ),
+                    "recommendation": (
+                        f"Ensure {friendly_name} is updated to the latest "
+                        "version. Enable automatic updates where available."
+                    ),
+                })
+            except Exception:
+                findings.append({
+                    "name": (
+                        f"Installed Software Detected: {friendly_name}"
+                    ),
+                    "severity": "Low",
+                    "description": (
+                        f"{friendly_name} is installed but its version "
+                        "could not be read from Info.plist."
+                    ),
+                    "recommendation": (
+                        f"Verify {friendly_name} is up to date."
+                    ),
+                })
+        if not findings:
+            findings.append({
+                "name": "Installed Software Versions",
+                "severity": "Info",
+                "description": (
+                    "No tracked software detected in /Applications."
+                ),
+                "recommendation": "No action required.",
+            })
+        return findings
+
     if sys.platform != "win32":
         return [{
             "name": "Installed Software Versions",
             "severity": "Info",
-            "description": "Software version check skipped — not running on Windows.",
+            "description": "Software version check skipped \u2014 not running on Windows.",
             "recommendation": "Run LocalScan on a Windows system.",
         }]
 
@@ -84,8 +178,8 @@ def check_software_versions() -> List[Dict[str, Any]]:
         lower_name = entry["name"].lower()
         for key, friendly in SOFTWARE_OF_INTEREST.items():
             if key in lower_name:
-                # Keep first (most recent) match
-                if friendly not in detected:
+                # Keep the entry with the highest version string
+                if friendly not in detected or _version_key(entry["version"]) > _version_key(detected[friendly]):
                     detected[friendly] = entry["version"]
 
     if detected:
@@ -133,11 +227,108 @@ def check_scheduled_tasks() -> List[Dict[str, Any]]:
     """Check scheduled tasks for suspicious entries."""
     findings = []
 
+    if PLATFORM == "darwin":
+        LAUNCH_DIRS = [
+            Path.home() / "Library" / "LaunchAgents",
+            Path("/Library/LaunchAgents"),
+            Path("/Library/LaunchDaemons"),
+        ]
+        # /System/Library/LaunchDaemons is scanned for count only —
+        # too many false positives from Apple's own daemons
+        SYSTEM_LAUNCH_DAEMONS = Path("/System/Library/LaunchDaemons")
+
+        suspicious_entries = []
+        plist_count = 0
+
+        for launch_dir in LAUNCH_DIRS:
+            if not launch_dir.exists():
+                continue
+            for plist_file in launch_dir.glob("*.plist"):
+                if plist_file.is_symlink():
+                    continue
+                plist_count += 1
+                try:
+                    with open(plist_file, "rb") as f:
+                        plist = plistlib.load(f)
+                    args = plist.get("ProgramArguments", [])
+                    args_str = " ".join(str(a) for a in args)
+                    run_at_load = plist.get("RunAtLoad", False)
+                    label = plist.get("Label", str(plist_file.name))
+
+                    # Apply existing suspicious patterns
+                    flagged = False
+                    for pattern in _SUSPICIOUS_TASK_PATTERNS:
+                        if pattern.search(args_str):
+                            suspicious_entries.append(
+                                f"{label} | {args_str[:120]}"
+                            )
+                            flagged = True
+                            break
+
+                    # Additional check: RunAtLoad with risky program
+                    if not flagged and run_at_load:
+                        risky_terms = [
+                            "curl", "wget", "bash -c",
+                            "/tmp/", "/var/tmp/",
+                        ]
+                        if any(t in args_str for t in risky_terms):
+                            suspicious_entries.append(
+                                f"{label} [RunAtLoad+risky] | "
+                                f"{args_str[:120]}"
+                            )
+                except Exception:
+                    pass
+
+        # Count Apple system daemons (info only)
+        system_daemon_count = 0
+        try:
+            if SYSTEM_LAUNCH_DAEMONS.exists():
+                system_daemon_count = sum(
+                    1 for p in SYSTEM_LAUNCH_DAEMONS.glob("*.plist")
+                    if not p.is_symlink()
+                )
+        except Exception:
+            pass
+
+        if suspicious_entries:
+            findings.append({
+                "name": "Suspicious Launch Agents/Daemons Detected",
+                "severity": "High",
+                "description": (
+                    f"{len(suspicious_entries)} LaunchAgent/Daemon "
+                    "plist(s) contain suspicious patterns "
+                    "(temp paths, curl/wget, encoded commands, etc.):\n"
+                    + "\n".join(suspicious_entries[:20])
+                ),
+                "recommendation": (
+                    "Review these plist files and remove any that are "
+                    "not legitimate. Use "
+                    "'sudo launchctl disable <label>' to disable."
+                ),
+            })
+        else:
+            findings.append({
+                "name": "Scheduled Tasks / Launch Agents",
+                "severity": "Info",
+                "description": (
+                    f"No suspicious LaunchAgents/Daemons detected "
+                    f"({plist_count} plists scanned across user and "
+                    f"system directories). "
+                    f"{system_daemon_count} Apple system daemons "
+                    "present (not scanned for suspicious patterns)."
+                ),
+                "recommendation": (
+                    "Periodically review LaunchAgents for unexpected "
+                    "entries."
+                ),
+            })
+        return findings
+
     if sys.platform != "win32":
         return [{
             "name": "Scheduled Tasks",
             "severity": "Info",
-            "description": "Scheduled task check skipped — not running on Windows.",
+            "description": "Scheduled task check skipped \u2014 not running on Windows.",
             "recommendation": "Run LocalScan on a Windows system.",
         }]
 
@@ -251,11 +442,82 @@ def check_startup_programs() -> List[Dict[str, Any]]:
     """Check startup registry entries for suspicious programs."""
     findings = []
 
+    if PLATFORM == "darwin":
+        STARTUP_DIRS = [
+            Path.home() / "Library" / "LaunchAgents",
+            Path("/Library/LaunchAgents"),
+        ]
+        entries = []
+        suspicious = []
+
+        for launch_dir in STARTUP_DIRS:
+            if not launch_dir.exists():
+                continue
+            for plist_file in launch_dir.glob("*.plist"):
+                if plist_file.is_symlink():
+                    continue
+                try:
+                    with open(plist_file, "rb") as f:
+                        plist = plistlib.load(f)
+                    label = plist.get("Label", str(plist_file.name))
+                    args = plist.get("ProgramArguments", [])
+                    args_str = " ".join(str(a) for a in args)
+                    entries.append({
+                        "dir": str(launch_dir),
+                        "name": label,
+                        "value": args_str,
+                    })
+                    for pattern in _STARTUP_SUSPICIOUS_PATTERNS:
+                        if pattern.search(args_str):
+                            suspicious.append(
+                                f"{launch_dir.name} | "
+                                f"{label} = {args_str[:120]}"
+                            )
+                            break
+                except Exception:
+                    pass
+
+        if suspicious:
+            return [{
+                "name": "Suspicious Startup LaunchAgent(s) Detected",
+                "severity": "High",
+                "description": (
+                    f"{len(suspicious)} LaunchAgent entry/entries "
+                    "contain suspicious patterns:\n"
+                    + "\n".join(suspicious[:20])
+                ),
+                "recommendation": (
+                    "Review these LaunchAgents using a tool like "
+                    "KnockKnock or Autoruns for Mac. Remove entries "
+                    "that are not legitimate."
+                ),
+            }]
+        elif entries:
+            return [{
+                "name": "Startup LaunchAgents",
+                "severity": "Info",
+                "description": (
+                    f"{len(entries)} LaunchAgent entry/entries found. "
+                    "None matched suspicious patterns."
+                ),
+                "recommendation": (
+                    "Periodically review LaunchAgents for unexpected "
+                    "programs."
+                ),
+            }]
+        else:
+            return [{
+                "name": "Startup LaunchAgents",
+                "severity": "Info",
+                "description": "No LaunchAgent entries found.",
+                "recommendation": "No action required.",
+            }]
+
     if sys.platform != "win32":
         return [{
             "name": "Startup Programs",
             "severity": "Info",
-            "description": "Startup program check skipped — not running on Windows.",
+            "description": "Startup program check skipped \u2014 not running on Windows.",
             "recommendation": "Run LocalScan on a Windows system.",
         }]
 

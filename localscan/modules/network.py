@@ -68,6 +68,33 @@ def _check_port(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> boo
         return False
 
 
+def _get_listening_interfaces(port: int) -> List[str]:
+    """
+    Return a list of bind addresses for which the given TCP port is
+    reachable. Checks 127.0.0.1 (loopback) and the machine's non-loopback
+    IPv4 addresses. Returns a list of addresses that accepted a connection.
+    Never raises.
+    """
+    candidates = ["127.0.0.1"]
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            addr = info[4][0]
+            if addr not in candidates:
+                candidates.append(addr)
+    except Exception:
+        pass
+
+    reachable = []
+    for addr in candidates:
+        try:
+            with socket.create_connection((addr, port), timeout=0.5):
+                reachable.append(addr)
+        except Exception:
+            pass
+    return reachable
+
+
 def _identify_service(port: int, banner: Optional[str] = None) -> Tuple[str, str]:
     """Return (service_name, confidence) for a port.
 
@@ -138,16 +165,81 @@ def check_firewall() -> Tuple[Dict[str, Any], Optional[bool]]:
         or None if the state could not be determined.
     """
     finding: Dict[str, Any] = {
-        "name": "Windows Firewall Status",
+        "name": "Firewall Status",
         "severity": "Info",
         "description": "",
         "recommendation": "",
         "confidence": "High",
     }
 
-    if sys.platform != "win32":
-        finding["description"] = "Firewall check skipped — not running on Windows."
-        finding["severity"] = "Info"
+    if sys.platform == "darwin":
+        FIREWALL_CMD = (
+            "/usr/libexec/ApplicationFirewall/socketfilterfw"
+            " --getglobalstate"
+        )
+        try:
+            result = subprocess.run(
+                FIREWALL_CMD.split(),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            output = result.stdout.lower()
+            if result.returncode != 0 or not output.strip():
+                finding["severity"] = "Info"
+                finding["confidence"] = "Low"
+                finding["description"] = (
+                    "macOS Application Firewall state could not be "
+                    "determined (socketfilterfw returned no output)."
+                )
+                finding["recommendation"] = (
+                    "Verify firewall status manually via System Settings "
+                    "> Network > Firewall."
+                )
+                return finding, None
+            if "disabled" in output:
+                finding["name"] = "macOS Application Firewall Disabled"
+                finding["severity"] = "Critical"
+                finding["description"] = (
+                    "The macOS Application Firewall is disabled. "
+                    "Incoming connections are not filtered."
+                )
+                finding["recommendation"] = (
+                    "Enable the firewall via System Settings > Network > "
+                    "Firewall, or run: sudo /usr/libexec/ApplicationFirewall"
+                    "/socketfilterfw --setglobalstate on"
+                )
+                return finding, True
+            else:
+                finding["name"] = "macOS Application Firewall Status"
+                finding["severity"] = "Info"
+                finding["description"] = "macOS Application Firewall is enabled."
+                finding["recommendation"] = "No action required."
+                return finding, False
+        except FileNotFoundError:
+            finding["severity"] = "Info"
+            finding["confidence"] = "Low"
+            finding["description"] = (
+                "socketfilterfw not found — firewall state could not "
+                "be determined."
+            )
+            finding["recommendation"] = (
+                "Verify firewall status via System Settings > Network > "
+                "Firewall."
+            )
+            return finding, None
+        except Exception as exc:
+            logger.exception("macOS firewall check failed: %s", exc)
+            finding["severity"] = "Info"
+            finding["confidence"] = "Low"
+            finding["description"] = f"macOS firewall check failed: {exc}"
+            finding["recommendation"] = "Verify firewall status manually."
+            return finding, None
+
+    elif sys.platform != "win32":
+        finding["description"] = (
+            "Firewall check not supported on this platform."
+        )
         finding["confidence"] = "Low"
         return finding, None
 
@@ -159,6 +251,24 @@ def check_firewall() -> Tuple[Dict[str, Any], Optional[bool]]:
             timeout=15,
         )
         output = result.stdout
+        if result.returncode != 0:
+            finding["severity"] = "Info"
+            finding["confidence"] = "Low"
+            finding["description"] = (
+                "netsh returned a non-zero exit code — firewall state "
+                "could not be confirmed."
+            )
+            finding["recommendation"] = "Verify firewall status manually."
+            return finding, None
+        if "State" not in output:
+            finding["severity"] = "Info"
+            finding["confidence"] = "Low"
+            finding["description"] = (
+                "netsh output did not match expected format — firewall "
+                "state could not be confirmed."
+            )
+            finding["recommendation"] = "Verify firewall status manually."
+            return finding, None
         if "OFF" in output.upper():
             finding["severity"] = "Critical"
             finding["description"] = (
@@ -206,15 +316,29 @@ def run_checks(
 
     # 1. Firewall check first (result is used for severity escalation)
     if progress_callback:
-        progress_callback("Checking Windows Firewall status…")
+        progress_callback("Checking firewall status…")
     firewall_finding, firewall_disabled = check_firewall()
     findings.append(firewall_finding)
 
     # 2. Scan open ports
     if quick:
         if progress_callback:
-            progress_callback("Quick mode: scanning well-known ports only (1–1024)…")
-        open_ports = scan_open_ports(1, 1024)
+            progress_callback("Quick mode: scanning well-known ports + all known dangerous ports…")
+        quick_ports = sorted(set(range(1, 1025)) | set(DANGEROUS_PORTS.keys()))
+        open_ports = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+            futures = {
+                executor.submit(_check_port, port, "127.0.0.1", 0.5): port
+                for port in quick_ports
+            }
+            for future in concurrent.futures.as_completed(futures):
+                port = futures[future]
+                try:
+                    if future.result():
+                        open_ports.append(port)
+                except Exception:
+                    pass
+        open_ports.sort()
     else:
         if progress_callback:
             progress_callback("Scanning open ports on localhost (1–10000)…")
@@ -238,6 +362,10 @@ def run_checks(
         if port in DANGEROUS_PORTS:
             svc_name, base_severity, svc_desc = DANGEROUS_PORTS[port]
 
+            # Check which interfaces the port is reachable on
+            interfaces = _get_listening_interfaces(port)
+            is_loopback_only = all(a.startswith("127.") for a in interfaces)
+
             # Attempt banner grab for confirmation
             banner = _grab_banner("127.0.0.1", port)
             _, confidence = _identify_service(port, banner)
@@ -253,16 +381,31 @@ def run_checks(
                     "making this system directly reachable from the network."
                 )
 
+            # Downgrade severity for loopback-only listeners
+            if is_loopback_only:
+                severity = _downgrade_severity(severity)
+
             # Downgrade severity for low-confidence detections
             if confidence == "Low":
                 severity = _downgrade_severity(severity)
 
             banner_note = f" Banner: {banner!r}" if banner else ""
+            if is_loopback_only:
+                finding_name = f"Dangerous Service — Loopback Only: {svc_name} (port {port})"
+                port_desc = (
+                    f"Port {port} ({svc_name}) is listening on loopback only "
+                    f"(not externally reachable). {svc_desc}.{extra_desc}"
+                )
+            else:
+                finding_name = f"Dangerous Service — Externally Exposed: {svc_name} (port {port})"
+                port_desc = (
+                    f"Port {port} ({svc_name}) is open and externally reachable. {svc_desc}.{extra_desc}"
+                )
             findings.append({
-                "name": f"Dangerous Service Exposed: {svc_name} (port {port})",
+                "name": finding_name,
                 "severity": severity,
                 "description": (
-                    f"Port {port} ({svc_name}) is open on localhost. {svc_desc}.{extra_desc}"
+                    port_desc
                     + (f"\n{banner_note}" if banner_note else "")
                 ),
                 "recommendation": (

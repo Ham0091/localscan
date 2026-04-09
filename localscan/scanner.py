@@ -73,35 +73,12 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# Parse args early so logging can respect --debug
-_ARGS = _parse_args()
-
-# Disable color if --no-color or colorama not available
-if _ARGS.no_color or not HAS_COLOR:
-    class _Stub:  # type: ignore[no-redef]
-        def __getattr__(self, _name: str) -> str:
-            return ""
-    Fore = _Stub()   # type: ignore[assignment]
-    Style = _Stub()  # type: ignore[assignment]
-
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scanner.log")
 
-_log_handlers: List[logging.Handler] = [
-    logging.FileHandler(LOG_FILE, encoding="utf-8"),
-]
-if _ARGS.debug:
-    _log_handlers.append(logging.StreamHandler(sys.stderr))
-
-logging.basicConfig(
-    handlers=_log_handlers,
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger("localscan")
 
 # ---------------------------------------------------------------------------
@@ -163,6 +140,18 @@ def _run_module(
     is_admin: bool = False,
 ) -> List[Dict[str, Any]]:
     """Run a single module and return its findings."""
+    if module is None:
+        return [{
+            "name": f"Module Unavailable: {module_name}",
+            "severity": "Info",
+            "description": (
+                f"The {module_name} module could not be loaded. "
+                "This scan category was skipped entirely."
+            ),
+            "recommendation": "Check scanner.log for the import error details.",
+            "confidence": "High",
+        }]
+
     _section(f"Running {module_name} checks… ({step}/{total})")
 
     findings: List[Dict[str, Any]] = []
@@ -186,12 +175,6 @@ def _run_module(
             quick=quick,
             is_admin=is_admin,
         )
-    except TypeError:
-        # Module does not yet accept keyword arguments — call without extras
-        try:
-            findings = module.run_checks(progress_callback=progress_callback)
-        except Exception as exc:  # noqa: BLE001
-            findings = _module_error(exc)
     except Exception as exc:  # noqa: BLE001
         findings = _module_error(exc)
 
@@ -216,7 +199,29 @@ def _run_module(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    args = _ARGS
+    args = _parse_args()
+
+    # Disable color if --no-color or colorama not available
+    global Fore, Style  # noqa: PLW0603
+    if args.no_color or not HAS_COLOR:
+        class _Stub:  # type: ignore[no-redef]
+            def __getattr__(self, _name: str) -> str:
+                return ""
+        Fore = _Stub()   # type: ignore[assignment]
+        Style = _Stub()  # type: ignore[assignment]
+
+    # Configure logging now that we know whether --debug was requested
+    _log_handlers: List[logging.Handler] = [
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ]
+    if args.debug:
+        _log_handlers.append(logging.StreamHandler(sys.stderr))
+    logging.basicConfig(
+        handlers=_log_handlers,
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     print()
     print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}")
@@ -261,6 +266,7 @@ def main() -> None:
         except ImportError as exc:
             logger.error("Could not import module '%s': %s", module_path, exc)
             _print_fail(f"Could not load module '{module_key}': {exc}")
+            modules_to_run.append((module_key, None))
 
     total_modules = len(modules_to_run)
     all_results: Dict[str, List[Dict[str, Any]]] = {}

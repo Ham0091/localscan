@@ -14,18 +14,19 @@ from typing import List, Dict, Any
 # ---------------------------------------------------------------------------
 
 SEVERITY_POINTS = {
-    "Critical": 20,
-    "High": 10,
-    "Medium": 5,
-    "Low": 2,
-    "Info": 0,
+    "Critical": 25,
+    "High":     10,
+    "Medium":    4,
+    "Low":       1,
+    "Info":      0,
 }
 
 SEVERITY_CAPS = {
-    "Critical": 40,
-    "High": 30,
-    "Medium": 20,
-    "Low": 10,
+    "Critical": 50,   # 2+ criticals = 50 pts max from this tier
+    "High":     30,
+    "Medium":   15,
+    "Low":       5,
+    "Info":      0,
 }
 
 SEVERITY_COLORS = {
@@ -37,22 +38,30 @@ SEVERITY_COLORS = {
 }
 
 
-def calculate_risk_score(all_findings: List[Dict[str, Any]]) -> int:
-    """Calculate an overall risk score 0–100 from findings."""
-    per_severity: Dict[str, int] = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
+def calculate_risk_score(findings: List[Dict[str, Any]]) -> int:
+    """
+    Calculate a risk score (0-100) from a list of findings.
 
-    for finding in all_findings:
-        sev = finding.get("severity", "Info")
-        if sev in per_severity:
-            per_severity[sev] += 1
+    Scoring rules:
+    - Each severity tier contributes min(count * points, cap) pts
+    - Any Critical finding guarantees the score is at least 50,
+      enforcing monotonicity: a host with a Critical always
+      outranks a host with zero Criticals
+    - Final score is capped at 100
+    """
+    counts = _count_severities(findings)
 
-    total = 0
-    for sev, count in per_severity.items():
-        points = SEVERITY_POINTS[sev] * count
-        capped = min(points, SEVERITY_CAPS[sev])
-        total += capped
+    raw = sum(
+        min(counts.get(sev, 0) * pts, SEVERITY_CAPS[sev])
+        for sev, pts in SEVERITY_POINTS.items()
+    )
 
-    return min(total, 100)
+    # Monotonicity guarantee: any Critical finding floors the
+    # score at 50
+    if counts.get("Critical", 0) > 0:
+        raw = max(raw, 50)
+
+    return min(raw, 100)
 
 
 def _count_severities(findings: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -129,6 +138,54 @@ def _findings_table(findings: List[Dict[str, Any]]) -> str:
     )
 
 
+_VALID_SEVERITIES = frozenset(
+    {"Critical", "High", "Medium", "Low", "Info"}
+)
+_REQUIRED_KEYS = {"name", "severity", "description",
+                  "recommendation"}
+
+
+def _validate_finding(
+    finding: Dict[str, Any],
+    module: str,
+) -> Dict[str, Any]:
+    """
+    Validate and normalise a single finding dict.
+    - Ensures required keys are present (fills in defaults if not)
+    - Normalises unknown severity values to 'Info'
+    - Never raises — returns a corrected finding
+    """
+    if not isinstance(finding, dict):
+        return {
+            "name": f"Malformed Finding ({module})",
+            "severity": "Info",
+            "description": (
+                f"A non-dict finding was returned by the "
+                f"{module} module: {finding!r:.200}"
+            ),
+            "recommendation": "Check scanner.log for details.",
+            "confidence": "Low",
+        }
+
+    out = dict(finding)
+    for key in _REQUIRED_KEYS:
+        if key not in out or not out[key]:
+            if key == "severity":
+                out[key] = "Info"
+            elif key == "recommendation":
+                out[key] = "No recommendation provided."
+            elif key == "name":
+                out[key] = f"Unnamed Finding ({module})"
+            elif key == "description":
+                out[key] = "No description provided."
+
+    if out.get("severity") not in _VALID_SEVERITIES:
+        out["_original_severity"] = out["severity"]
+        out["severity"] = "Info"
+
+    return out
+
+
 def generate_report(
     module_results: Dict[str, List[Dict[str, Any]]],
     output_path: str,
@@ -146,7 +203,14 @@ def generate_report(
     except Exception:  # noqa: BLE001
         hostname = "unknown"
 
-    all_findings = [f for findings in module_results.values() for f in findings]
+    validated_results: Dict[str, List[Dict[str, Any]]] = {}
+    for module_name, findings_list in module_results.items():
+        validated_results[module_name] = [
+            _validate_finding(f, module_name)
+            for f in (findings_list or [])
+        ]
+
+    all_findings = [f for findings in validated_results.values() for f in findings]
     score = calculate_risk_score(all_findings)
     counts = _count_severities(all_findings)
     summary = _executive_summary(score, counts)
@@ -169,7 +233,7 @@ def generate_report(
         "filesystem": "Filesystem",
         "services": "Services & Software",
     }
-    for module_key, findings in module_results.items():
+    for module_key, findings in validated_results.items():
         display_name = module_display_names.get(module_key, module_key.title())
         section_html += f"""
         <section class="module-section">
@@ -184,16 +248,21 @@ def generate_report(
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LocalScan Report — {_h(hostname)}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
+  body, * {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "Helvetica Neue", Arial, sans-serif;
+  }}
+  code, pre, .log, .monospace {{
+      font-family: "JetBrains Mono", "Fira Code", "Cascadia Code",
+          "Consolas", "Courier New", monospace;
+  }}
+
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
   body {{
     background: #0a0a0f;
     color: #e4e4e7;
-    font-family: 'JetBrains Mono', 'Courier New', monospace;
     font-size: 14px;
     line-height: 1.6;
     padding: 2rem;

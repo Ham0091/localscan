@@ -36,12 +36,24 @@ BROWSER_DB_PATHS = {
     "Edge": [
         Path.home() / "AppData" / "Local" / "Microsoft" / "Edge" / "User Data" / "Default" / "Login Data",
     ],
+    "Safari": [
+        Path.home() / "Library" / "Safari" / "Databases",
+    ],
 }
 
 SCAN_DIRS = [
     Path.home() / "Desktop",
     Path.home() / "Documents",
     Path.home() / "Downloads",
+]
+
+EXTRA_SECRET_PATHS = [
+    Path.home() / ".aws" / "credentials",
+    Path.home() / ".docker" / "config.json",
+    Path.home() / ".npmrc",
+    Path.home() / ".pypirc",
+    Path.home() / ".netrc",
+    Path.home() / ".git-credentials",
 ]
 
 # Safety limits
@@ -131,21 +143,40 @@ def _check_ssh_permissions() -> List[Dict[str, Any]]:
                     "confidence": "High",
                 })
             # Check individual key files
+            # Files that are definitively not private keys
+            NON_KEY_FILES = {
+                "known_hosts", "authorized_keys", "authorized_keys2",
+                "config", "environment", "rc",
+            }
             for key_file in ssh_dir.iterdir():
                 if key_file.is_symlink():
                     continue
-                if key_file.is_file() and not key_file.name.endswith(".pub"):
-                    key_mode = stat.S_IMODE(os.stat(key_file).st_mode)
-                    if key_mode & 0o077:
-                        findings.append({
-                            "name": f"SSH Key File Has Weak Permissions: {key_file.name}",
-                            "severity": "High",
-                            "description": (
-                                f"SSH private key '{key_file}' has permissions {oct(key_mode)}."
-                            ),
-                            "recommendation": f"Run 'chmod 600 {key_file}' to restrict access.",
-                            "confidence": "High",
-                        })
+                if not key_file.is_file():
+                    continue
+                name = key_file.name
+                # Skip known non-key filenames
+                if name in NON_KEY_FILES:
+                    continue
+                # Skip public keys
+                if name.endswith(".pub"):
+                    continue
+                # Treat remaining files as potential private keys
+                key_mode = stat.S_IMODE(os.stat(key_file).st_mode)
+                if key_mode & 0o077:
+                    findings.append({
+                        "name": (
+                            f"SSH Key File Has Weak Permissions: {name}"
+                        ),
+                        "severity": "High",
+                        "description": (
+                            f"SSH private key '{key_file}' has permissions "
+                            f"{oct(key_mode)}."
+                        ),
+                        "recommendation": (
+                            f"Run 'chmod 600 {key_file}' to restrict access."
+                        ),
+                        "confidence": "High",
+                    })
         except Exception as exc:  # noqa: BLE001
             logger.warning("SSH permission check failed: %s", exc)
 
@@ -232,6 +263,59 @@ def _check_pem_key_files() -> List[Dict[str, Any]]:
     return findings
 
 
+def _check_known_secret_files() -> List[Dict[str, Any]]:
+    """
+    Check for well-known secret store files that should not exist
+    as plaintext on disk.
+    """
+    findings = []
+    found = []
+    for path in EXTRA_SECRET_PATHS:
+        try:
+            if path.is_symlink():
+                continue
+            if path.exists():
+                mode = None
+                if sys.platform != "win32":
+                    try:
+                        mode = stat.S_IMODE(os.stat(path).st_mode)
+                    except OSError:
+                        pass
+                world_readable = (
+                    mode is not None and bool(mode & 0o044)
+                )
+                found.append({
+                    "path": str(path),
+                    "world_readable": world_readable,
+                })
+        except Exception:
+            pass
+
+    for entry in found:
+        severity = "High" if entry["world_readable"] else "Medium"
+        perm_note = (
+            " The file is world-readable."
+            if entry["world_readable"] else ""
+        )
+        findings.append({
+            "name": "Known Secret File Found",
+            "severity": severity,
+            "description": (
+                f"A known credential file was found at: "
+                f"{entry['path']}.{perm_note} "
+                "Contents were NOT read."
+            ),
+            "recommendation": (
+                "Review this file and ensure it does not contain "
+                "plaintext credentials. Restrict permissions to "
+                "owner-only (chmod 600) and consider using a "
+                "secrets manager instead."
+            ),
+            "confidence": "High",
+        })
+    return findings
+
+
 def _check_browser_databases() -> List[Dict[str, Any]]:
     """Check for browser password databases (existence only — contents are never read)."""
     findings = []
@@ -279,6 +363,10 @@ def run_checks(
 
     sub_checks = [
         ("Scanning for potential credential files", _scan_credential_files),
+        (
+            "Checking for known secret files (.aws, .docker, .npmrc, etc.)",
+            _check_known_secret_files
+        ),
         ("Checking .ssh directory permissions", _check_ssh_permissions),
         ("Checking for .pem/.key files in home directory", _check_pem_key_files),
         ("Checking for browser password databases", _check_browser_databases),
