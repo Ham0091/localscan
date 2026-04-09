@@ -79,6 +79,11 @@ def _parse_args() -> argparse.Namespace:
         dest="no_color",
         help="Disable colored terminal output",
     )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Generate an HTML report in localscan/reports/ and open it in the browser",
+    )
     return parser.parse_args()
 
 
@@ -140,6 +145,15 @@ def _is_admin() -> bool:
 # Module runner
 # ---------------------------------------------------------------------------
 
+# Module definitions: (key, importable path, display name)
+MODULE_DEFS = [
+    ("network",    "localscan.modules.network",    "Network"),
+    ("system",     "localscan.modules.system",     "System"),
+    ("filesystem", "localscan.modules.filesystem",  "Filesystem"),
+    ("services",   "localscan.modules.services",    "Services"),
+]
+
+
 def _run_module(
     module_name: str,
     module,
@@ -147,6 +161,7 @@ def _run_module(
     total: int,
     quick: bool = False,
     is_admin: bool = False,
+    on_progress: Any = None,
 ) -> List[Dict[str, Any]]:
     """Run a single module and return its findings."""
     if module is None:
@@ -167,6 +182,8 @@ def _run_module(
 
     def progress_callback(msg: str) -> None:
         _print_info(msg)
+        if on_progress:
+            on_progress(msg)
 
     def _module_error(exc: Exception) -> List[Dict[str, Any]]:
         logger.exception("Module '%s' crashed: %s", module_name, exc)
@@ -201,6 +218,99 @@ def _run_module(
             _print_pass(f"[{sev}{conf_str}] {name}")
 
     return findings
+
+
+# ---------------------------------------------------------------------------
+# Reusable scan core — used by both CLI and GUI
+# ---------------------------------------------------------------------------
+
+class ScanCallbacks:
+    """Optional callbacks for scan progress. All default to no-ops."""
+
+    def on_module_start(self, module_name: str, step: int, total: int) -> None:
+        """Called when a module begins running."""
+
+    def on_finding(self, module_name: str, finding: Dict[str, Any]) -> None:
+        """Called for each individual finding."""
+
+    def on_progress(self, module_name: str, message: str) -> None:
+        """Called for progress messages within a module."""
+
+    def on_module_done(self, module_name: str, findings: List[Dict[str, Any]],
+                       step: int, total: int) -> None:
+        """Called when a module finishes. step/total for percentage."""
+
+    def on_scan_complete(self, results: Dict[str, List[Dict[str, Any]]]) -> None:
+        """Called when the entire scan is finished."""
+
+
+def run_scan(
+    *,
+    quick: bool = False,
+    is_admin: bool | None = None,
+    callbacks: ScanCallbacks | None = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Execute all scan modules and return aggregated results.
+
+    This is the reusable core shared by the CLI ``main()`` and the GUI
+    ``ScanWorker``.  It never touches CLI args, report generation, or the
+    terminal banner — callers handle those concerns.
+
+    Parameters
+    ----------
+    quick : bool
+        Skip heavy checks (e.g. full port scan).
+    is_admin : bool | None
+        Whether we're running elevated.  *None* = auto-detect.
+    callbacks : ScanCallbacks | None
+        Optional observer for live progress.
+
+    Returns
+    -------
+    dict mapping module key -> list of finding dicts.
+    """
+    if callbacks is None:
+        callbacks = ScanCallbacks()
+
+    if is_admin is None:
+        is_admin = _is_admin()
+
+    modules_to_run = []
+    for module_key, module_path, _display in MODULE_DEFS:
+        try:
+            mod = importlib.import_module(module_path, package="localscan")
+            modules_to_run.append((module_key, mod))
+        except ImportError as exc:
+            logger.error("Could not import module '%s': %s", module_path, exc)
+            _print_fail(f"Could not load module '{module_key}': {exc}")
+            modules_to_run.append((module_key, None))
+
+    total_modules = len(modules_to_run)
+    all_results: Dict[str, List[Dict[str, Any]]] = {}
+
+    for step, (module_key, module) in enumerate(modules_to_run, start=1):
+        display_name = module_key.title()
+        callbacks.on_module_start(display_name, step, total_modules)
+
+        results = _run_module(
+            display_name,
+            module,
+            step,
+            total_modules,
+            quick=quick,
+            is_admin=is_admin,
+            on_progress=lambda msg, mn=display_name: callbacks.on_progress(mn, msg),
+        )
+        all_results[module_key] = results
+
+        for finding in results:
+            callbacks.on_finding(display_name, finding)
+
+        callbacks.on_module_done(display_name, results, step, total_modules)
+
+    callbacks.on_scan_complete(all_results)
+    return all_results
 
 
 # ---------------------------------------------------------------------------
@@ -259,48 +369,19 @@ def main() -> None:
             "Registry, WMI, and service checks may be incomplete."
         )
 
-    # Import modules lazily so that a missing dependency only affects that module
-    modules_to_run = []
-    module_defs = [
-        ("network", "localscan.modules.network"),
-        ("system", "localscan.modules.system"),
-        ("filesystem", "localscan.modules.filesystem"),
-        ("services", "localscan.modules.services"),
-    ]
+    # Run scan via reusable core
+    all_results = run_scan(quick=args.quick, is_admin=is_admin)
 
-    for module_key, module_path in module_defs:
-        try:
-            mod = importlib.import_module(module_path)
-            modules_to_run.append((module_key, mod))
-        except ImportError as exc:
-            logger.error("Could not import module '%s': %s", module_path, exc)
-            _print_fail(f"Could not load module '{module_key}': {exc}")
-            modules_to_run.append((module_key, None))
-
-    total_modules = len(modules_to_run)
-    all_results: Dict[str, List[Dict[str, Any]]] = {}
-
-    for step, (module_key, module) in enumerate(modules_to_run, start=1):
-        results = _run_module(
-            module_key.title(),
-            module,
-            step,
-            total_modules,
-            quick=args.quick,
-            is_admin=is_admin,
-        )
-        all_results[module_key] = results
-
-    # Generate report
-    _section("Generating report…")
-    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_filename = f"report_{timestamp_str}.html"
-    report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), report_filename)
+    # Always compute summary stats for the terminal output
+    all_findings = [f for findings in all_results.values() for f in findings]
 
     try:
-        from localscan.report import generate_report, calculate_risk_score, _count_severities  # noqa: PLC0415
-        generate_report(all_results, report_path)
-        all_findings = [f for findings in all_results.values() for f in findings]
+        from .report import (  # noqa: PLC0415
+            generate_report,
+            calculate_risk_score,
+            _count_severities,
+            get_report_path,
+        )
         score = calculate_risk_score(all_findings)
         counts = _count_severities(all_findings)
 
@@ -316,16 +397,23 @@ def main() -> None:
             f"Low: {counts['Low']}  "
             f"Info: {counts['Info']}"
         )
-        print(f"  Report     : {report_path}")
         print()
 
-        _print_pass(f"Report written to {report_filename}")
+        if args.report:
+            _section("Generating report…")
+            report_path = get_report_path()
+            generate_report(all_results, str(report_path))
+            print(f"  Report     : {report_path}")
+            print()
+            _print_pass(f"Report written to {report_path.name}")
 
-        # Open in default browser
-        try:
-            webbrowser.open(f"file://{report_path}")
-        except Exception:  # noqa: BLE001
-            pass
+            # Open in default browser
+            try:
+                webbrowser.open(report_path.as_uri())
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            _print_info("No report generated. Use --report to save an HTML report.")
 
     except Exception as exc:  # noqa: BLE001
         logger.exception("Report generation failed: %s", exc)

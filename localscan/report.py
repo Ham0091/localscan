@@ -6,7 +6,26 @@ Produces a self-contained, timestamped HTML report with dark theme.
 import html
 import socket
 from datetime import datetime
-from typing import List, Dict, Any
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+
+# ---------------------------------------------------------------------------
+# Report path helpers
+# ---------------------------------------------------------------------------
+
+def get_reports_dir() -> Path:
+    """Return the reports output directory, creating it if needed."""
+    d = Path(__file__).parent / "reports"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def get_report_path(timestamp: Optional[str] = None) -> Path:
+    """Return a full path for a timestamped report in the reports directory."""
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return get_reports_dir() / f"report_{timestamp}.html"
 
 
 # ---------------------------------------------------------------------------

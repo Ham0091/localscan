@@ -17,6 +17,8 @@ env/
 # LocalScan runtime artifacts
 scanner.log
 report_*.html
+localscan/reports/*.html
+!localscan/reports/.gitkeep
 
 # IDE / editor
 .vscode/
