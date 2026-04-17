@@ -8,6 +8,7 @@ import socket
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from localscan.schema import normalize_findings
 
 
 # ---------------------------------------------------------------------------
@@ -157,52 +158,66 @@ def _findings_table(findings: List[Dict[str, Any]]) -> str:
     )
 
 
-_VALID_SEVERITIES = frozenset(
-    {"Critical", "High", "Medium", "Low", "Info"}
-)
-_REQUIRED_KEYS = {"name", "severity", "description",
-                  "recommendation"}
+def _severity_bars(counts: Dict[str, int]) -> str:
+    total = max(1, sum(counts.values()))
+    rows = []
+    for sev in ("Critical", "High", "Medium", "Low", "Info"):
+        count = counts.get(sev, 0)
+        width = (count / total) * 100
+        color = SEVERITY_COLORS.get(sev, SEVERITY_COLORS["Info"])
+        rows.append(
+            f"<div class='bar-row'>"
+            f"<div class='bar-label'>{_h(sev)}</div>"
+            f"<div class='bar-track'><div class='bar-fill' style='width:{width:.2f}%;background:{color}'></div></div>"
+            f"<div class='bar-count'>{count}</div>"
+            f"</div>"
+        )
+    return "<div class='severity-bars'>" + "".join(rows) + "</div>"
 
 
-def _validate_finding(
-    finding: Dict[str, Any],
-    module: str,
-) -> Dict[str, Any]:
-    """
-    Validate and normalise a single finding dict.
-    - Ensures required keys are present (fills in defaults if not)
-    - Normalises unknown severity values to 'Info'
-    - Never raises — returns a corrected finding
-    """
-    if not isinstance(finding, dict):
-        return {
-            "name": f"Malformed Finding ({module})",
-            "severity": "Info",
-            "description": (
-                f"A non-dict finding was returned by the "
-                f"{module} module: {finding!r:.200}"
-            ),
-            "recommendation": "Check scanner.log for details.",
-            "confidence": "Low",
-        }
+def _score_breakdown(counts: Dict[str, int]) -> str:
+    rows = []
+    for sev in ("Critical", "High", "Medium", "Low"):
+        points = SEVERITY_POINTS[sev]
+        cap = SEVERITY_CAPS[sev]
+        count = counts.get(sev, 0)
+        contribution = min(count * points, cap)
+        rows.append(
+            "<tr>"
+            f"<td>{_h(sev)}</td>"
+            f"<td>{count}</td>"
+            f"<td>{points}</td>"
+            f"<td>{cap}</td>"
+            f"<td>{contribution}</td>"
+            "</tr>"
+        )
+    return (
+        "<table class='score-breakdown'>"
+        "<thead><tr><th>Severity</th><th>Count</th><th>Pts/Item</th><th>Cap</th><th>Contribution</th></tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody>"
+        "</table>"
+    )
 
-    out = dict(finding)
-    for key in _REQUIRED_KEYS:
-        if key not in out or not out[key]:
-            if key == "severity":
-                out[key] = "Info"
-            elif key == "recommendation":
-                out[key] = "No recommendation provided."
-            elif key == "name":
-                out[key] = f"Unnamed Finding ({module})"
-            elif key == "description":
-                out[key] = "No description provided."
 
-    if out.get("severity") not in _VALID_SEVERITIES:
-        out["_original_severity"] = out["severity"]
-        out["severity"] = "Info"
-
-    return out
+def _top_risks(all_findings: List[Dict[str, Any]], limit: int = 8) -> str:
+    priority = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
+    top = sorted(
+        all_findings,
+        key=lambda f: (priority.get(f.get("severity", "Info"), 4), f.get("name", "")),
+    )[:limit]
+    if not top:
+        return "<p class='no-findings'>No findings to summarize.</p>"
+    items = []
+    for f in top:
+        sev = f.get("severity", "Info")
+        color = SEVERITY_COLORS.get(sev, SEVERITY_COLORS["Info"])
+        items.append(
+            "<li>"
+            f"<span class='badge' style='background:{color}'>{_h(sev)}</span> "
+            f"{_h(f.get('name', ''))}"
+            "</li>"
+        )
+    return "<ul class='top-risks'>" + "".join(items) + "</ul>"
 
 
 def generate_report(
@@ -224,15 +239,15 @@ def generate_report(
 
     validated_results: Dict[str, List[Dict[str, Any]]] = {}
     for module_name, findings_list in module_results.items():
-        validated_results[module_name] = [
-            _validate_finding(f, module_name)
-            for f in (findings_list or [])
-        ]
+        validated_results[module_name] = normalize_findings(findings_list or [], module_name)
 
     all_findings = [f for findings in validated_results.values() for f in findings]
     score = calculate_risk_score(all_findings)
     counts = _count_severities(all_findings)
     summary = _executive_summary(score, counts)
+    severity_chart = _severity_bars(counts)
+    score_breakdown = _score_breakdown(counts)
+    top_risk_items = _top_risks(all_findings)
 
     # Score color
     if score >= 70:
@@ -315,6 +330,10 @@ def generate_report(
     margin-bottom: 2rem;
   }}
 
+  .summary-grid.secondary {{
+    grid-template-columns: 1fr 1fr;
+  }}
+
   .score-card {{
     background: #12121a;
     border: 1px solid #27272a;
@@ -365,6 +384,70 @@ def generate_report(
   .executive-card p {{
     color: #a1a1aa;
     line-height: 1.7;
+  }}
+
+  .sub-card {{
+    background: #12121a;
+    border: 1px solid #27272a;
+    border-radius: 8px;
+    padding: 1.2rem;
+  }}
+
+  .sub-card h3 {{
+    font-size: 0.9rem;
+    margin-bottom: 0.8rem;
+    color: #e4e4e7;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }}
+
+  .severity-bars {{
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }}
+
+  .bar-row {{
+    display: grid;
+    grid-template-columns: 90px 1fr 30px;
+    align-items: center;
+    gap: 0.7rem;
+  }}
+
+  .bar-label, .bar-count {{
+    color: #a1a1aa;
+    font-size: 0.8rem;
+  }}
+
+  .bar-track {{
+    width: 100%;
+    height: 10px;
+    background: #1c1c28;
+    border-radius: 999px;
+    overflow: hidden;
+    border: 1px solid #27272a;
+  }}
+
+  .bar-fill {{
+    height: 100%;
+    border-radius: 999px;
+  }}
+
+  .score-breakdown th, .score-breakdown td {{
+    padding: 0.45rem 0.55rem;
+    font-size: 0.75rem;
+  }}
+
+  .top-risks {{
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }}
+
+  .top-risks li {{
+    color: #d4d4d8;
+    font-size: 0.82rem;
   }}
 
   .module-section {{
@@ -481,6 +564,22 @@ def generate_report(
   <div class="executive-card">
     <p>{_h(summary)}</p>
   </div>
+</div>
+
+<div class="summary-grid secondary">
+  <div class="sub-card">
+    <h3>Severity Distribution</h3>
+    {severity_chart}
+  </div>
+  <div class="sub-card">
+    <h3>Top Risk Findings</h3>
+    {top_risk_items}
+  </div>
+</div>
+
+<div class="module-section">
+  <h2>Risk Score Breakdown</h2>
+  {score_breakdown}
 </div>
 
 {section_html}

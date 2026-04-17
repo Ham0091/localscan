@@ -28,6 +28,7 @@ This tool does **not** perform remote exploitation, packet interception, or vuln
 * firewall status check
 * insecure protocol detection
 * service banner collection
+* listener binding exposure analysis (loopback vs externally reachable)
 
 ### System Checks
 
@@ -53,6 +54,7 @@ This tool does **not** perform remote exploitation, packet interception, or vuln
 * scheduled task inspection
 * installed software inventory
 * common risky software detection
+* basic software version baseline checks
 
 ---
 
@@ -64,6 +66,7 @@ LocalScan generates:
 * severity summary
 * risk score
 * timestamped scan output
+* severity distribution and score-breakdown visuals
 
 ---
 
@@ -99,6 +102,13 @@ Recommended:
 
 ```bash
 python -m localscan.scanner
+```
+
+By default, this generates an HTML report under `localscan/reports/`.
+To skip report generation:
+
+```bash
+python -m localscan.scanner --no-report
 ```
 
 If using package entrypoint:
