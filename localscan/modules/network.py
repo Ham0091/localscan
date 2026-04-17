@@ -38,7 +38,7 @@ _BANNER_HINTS = {
     "MySQL": "MySQL",
 }
 
-BANNER_SAMPLE_LIMIT = 50
+MAX_DISPLAYED_BANNERS = 50
 
 
 def _is_loopback_addr(addr: str) -> bool:
@@ -442,9 +442,9 @@ def run_checks(
                     f"Port {port} ({service_name}, confidence={confidence}): {banner}"
                 )
         if banner_entries:
-            sample = "\n".join(banner_entries[:BANNER_SAMPLE_LIMIT])
-            if len(banner_entries) > BANNER_SAMPLE_LIMIT:
-                sample += f"\n... and {len(banner_entries) - BANNER_SAMPLE_LIMIT} more banner(s)"
+            sample = "\n".join(banner_entries[:MAX_DISPLAYED_BANNERS])
+            if len(banner_entries) > MAX_DISPLAYED_BANNERS:
+                sample += f"\n... and {len(banner_entries) - MAX_DISPLAYED_BANNERS} more banner(s)"
             findings.append({
                 "name": "Service Banner Collection",
                 "severity": "Info",
