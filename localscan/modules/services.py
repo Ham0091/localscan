@@ -257,7 +257,7 @@ def check_software_versions() -> List[Dict[str, Any]]:
         return [{
             "name": "Installed Software Versions",
             "severity": "Info",
-            "description": "Software version check skipped — not running on Windows.",
+            "description": "Software version check skipped -- not running on Windows.",
             "recommendation": "Run LocalScan on a Windows system.",
             "confidence": "High",
         }]
