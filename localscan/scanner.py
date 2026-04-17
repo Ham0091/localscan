@@ -29,6 +29,7 @@ import traceback
 import webbrowser
 from datetime import datetime
 from typing import Dict, List, Any
+from localscan.schema import normalize_findings
 
 # ---------------------------------------------------------------------------
 # Package path bootstrap — ensures "localscan.*" imports resolve whether this
@@ -81,8 +82,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--report",
-        action="store_true",
-        help="Generate an HTML report in localscan/reports/ and open it in the browser",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Generate an HTML report in localscan/reports/ and open it in the browser (use --no-report to disable)",
     )
     return parser.parse_args()
 
@@ -193,6 +195,7 @@ def _run_module(
             "severity": "Info",
             "description": f"The module crashed: {exc}",
             "recommendation": "Check scanner.log for the full traceback.",
+            "confidence": "Low",
         }]
 
     try:
@@ -203,6 +206,18 @@ def _run_module(
         )
     except Exception as exc:  # noqa: BLE001
         findings = _module_error(exc)
+
+    if not isinstance(findings, list):
+        findings = [{
+            "name": f"Invalid Module Output: {module_name}",
+            "severity": "Info",
+            "description": (
+                f"The module returned {type(findings).__name__} instead of a list of findings."
+            ),
+            "recommendation": "Check module implementation and scanner.log.",
+            "confidence": "Low",
+        }]
+    findings = normalize_findings(findings, module_name)
 
     # Print per-finding summary
     for f in findings:
@@ -413,7 +428,7 @@ def main() -> None:
             except Exception:  # noqa: BLE001
                 pass
         else:
-            _print_info("No report generated. Use --report to save an HTML report.")
+            _print_info("Report generation disabled by --no-report.")
 
     except Exception as exc:  # noqa: BLE001
         logger.exception("Report generation failed: %s", exc)

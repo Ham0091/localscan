@@ -837,8 +837,12 @@ def check_powershell_execution_policy() -> Dict[str, Any]:
             }
 
     if sys.platform != "win32":
-        # On non-Windows, try running pwsh if available
-        pass
+        return {
+            "name": "PowerShell Execution Policy",
+            "severity": "Info",
+            "description": "PowerShell execution policy check skipped — not running on Windows.",
+            "recommendation": "Run LocalScan on Windows to assess execution policy.",
+        }
 
     try:
         result = subprocess.run(

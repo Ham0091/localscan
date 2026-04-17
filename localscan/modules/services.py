@@ -11,7 +11,7 @@ import sys
 import logging
 import re
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,60 @@ SOFTWARE_OF_INTEREST = {
     "google chrome": "Google Chrome",
     "mozilla firefox": "Mozilla Firefox",
 }
+
+# Conservative baselines for version-intelligence checks.
+MIN_SAFE_VERSIONS: Dict[str, Tuple[int, ...]] = {
+    "Google Chrome": (120, 0, 0, 0),
+    "Mozilla Firefox": (120, 0, 0, 0),
+    "7-Zip": (23, 0),
+    "Java": (17, 0),
+    "VLC Media Player": (3, 0, 20),
+}
+
+RISKY_SOFTWARE_PATTERNS: List[Dict[str, str]] = [
+    {
+        "pattern": "teamviewer",
+        "name": "TeamViewer",
+        "severity": "Medium",
+        "reason": "Remote access software increases attack surface if misconfigured.",
+    },
+    {
+        "pattern": "anydesk",
+        "name": "AnyDesk",
+        "severity": "Medium",
+        "reason": "Remote access software increases attack surface if misconfigured.",
+    },
+    {
+        "pattern": "ultravnc",
+        "name": "UltraVNC",
+        "severity": "Medium",
+        "reason": "Remote desktop software should be tightly controlled and monitored.",
+    },
+    {
+        "pattern": "tightvnc",
+        "name": "TightVNC",
+        "severity": "Medium",
+        "reason": "Remote desktop software should be tightly controlled and monitored.",
+    },
+    {
+        "pattern": "realvnc",
+        "name": "RealVNC",
+        "severity": "Medium",
+        "reason": "Remote desktop software should be tightly controlled and monitored.",
+    },
+    {
+        "pattern": "wireshark",
+        "name": "Wireshark",
+        "severity": "Low",
+        "reason": "Packet-capture tooling is powerful and should be restricted to trusted users.",
+    },
+    {
+        "pattern": "nmap",
+        "name": "Nmap",
+        "severity": "Low",
+        "reason": "Reconnaissance tooling should be controlled on managed endpoints.",
+    },
+]
 
 
 def _get_installed_software_windows() -> List[Dict[str, str]]:
@@ -91,15 +145,53 @@ def _get_installed_software_windows() -> List[Dict[str, str]]:
 
 
 def _version_key(v: str):
-    """Parse a version string into a list of ints for comparison."""
+    """Parse a version string into numeric components for coarse comparison.
+
+    Non-numeric labels (e.g., beta/rc) are ignored to keep parsing resilient
+    across inconsistent vendor version formats.
+    """
     try:
-        return [int(x) for x in v.split(".") if x.isdigit()]
+        nums = [int(x) for x in re.findall(r"\d+", v or "")]
+        return nums if nums else [0]
     except Exception:
         return [0]
 
 
+def _version_tuple(v: str) -> Tuple[int, ...]:
+    return tuple(_version_key(v))
+
+
+def _find_risky_software(installed: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    seen = set()
+    for entry in installed:
+        name = entry.get("name", "")
+        lower = name.lower()
+        for rule in RISKY_SOFTWARE_PATTERNS:
+            if rule["pattern"] not in lower:
+                continue
+            key = rule["name"].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append({
+                "name": f"Potentially Risky Software Installed: {rule['name']}",
+                "severity": rule["severity"],
+                "description": (
+                    f"Detected installed software matching '{rule['name']}'. "
+                    f"{rule['reason']}"
+                ),
+                "recommendation": (
+                    "Validate business need, restrict who can run this software, and "
+                    "ensure it is patched and monitored."
+                ),
+                "confidence": "Medium",
+            })
+    return findings
+
+
 def check_software_versions() -> List[Dict[str, Any]]:
-    """Detect installed versions of known software and flag them for review."""
+    """Detect installed versions and identify potentially risky software."""
     findings = []
 
     if PLATFORM == "darwin":
@@ -111,7 +203,10 @@ def check_software_versions() -> List[Dict[str, Any]]:
             "zoom.us.app": "Zoom",
             "Microsoft Word.app": "Microsoft Word",
             "Microsoft Excel.app": "Microsoft Excel",
+            "TeamViewer.app": "TeamViewer",
+            "AnyDesk.app": "AnyDesk",
         }
+        installed_for_risk: List[Dict[str, str]] = []
         for app_filename, friendly_name in apps_to_find.items():
             app_path = Path("/Applications") / app_filename
             plist_path = app_path / "Contents" / "Info.plist"
@@ -120,46 +215,41 @@ def check_software_versions() -> List[Dict[str, Any]]:
             try:
                 with open(plist_path, "rb") as f:
                     plist = plistlib.load(f)
-                version = plist.get(
-                    "CFBundleShortVersionString", "Unknown"
-                )
+                version = str(plist.get("CFBundleShortVersionString", "Unknown"))
+                installed_for_risk.append({"name": friendly_name, "version": version})
                 findings.append({
-                    "name": (
-                        f"Installed Software Detected: "
-                        f"{friendly_name} v{version}"
-                    ),
+                    "name": f"Installed Software Detected: {friendly_name} v{version}",
                     "severity": "Low",
                     "description": (
                         f"{friendly_name} version {version} is installed. "
                         "Automated update status could not be verified."
                     ),
                     "recommendation": (
-                        f"Ensure {friendly_name} is updated to the latest "
-                        "version. Enable automatic updates where available."
+                        f"Ensure {friendly_name} is updated to the latest version "
+                        "and auto-updates are enabled."
                     ),
+                    "confidence": "Medium",
                 })
             except Exception:
+                installed_for_risk.append({"name": friendly_name, "version": "Unknown"})
                 findings.append({
-                    "name": (
-                        f"Installed Software Detected: {friendly_name}"
-                    ),
+                    "name": f"Installed Software Detected: {friendly_name}",
                     "severity": "Low",
                     "description": (
-                        f"{friendly_name} is installed but its version "
-                        "could not be read from Info.plist."
+                        f"{friendly_name} is installed but its version could not be read."
                     ),
-                    "recommendation": (
-                        f"Verify {friendly_name} is up to date."
-                    ),
+                    "recommendation": f"Verify {friendly_name} is up to date.",
+                    "confidence": "Low",
                 })
+
+        findings.extend(_find_risky_software(installed_for_risk))
         if not findings:
             findings.append({
                 "name": "Installed Software Versions",
                 "severity": "Info",
-                "description": (
-                    "No tracked software detected in /Applications."
-                ),
+                "description": "No tracked software detected in /Applications.",
                 "recommendation": "No action required.",
+                "confidence": "High",
             })
         return findings
 
@@ -167,18 +257,17 @@ def check_software_versions() -> List[Dict[str, Any]]:
         return [{
             "name": "Installed Software Versions",
             "severity": "Info",
-            "description": "Software version check skipped \u2014 not running on Windows.",
+            "description": "Software version check skipped -- not running on Windows.",
             "recommendation": "Run LocalScan on a Windows system.",
+            "confidence": "High",
         }]
 
     installed = _get_installed_software_windows()
-
     detected: Dict[str, str] = {}
     for entry in installed:
         lower_name = entry["name"].lower()
         for key, friendly in SOFTWARE_OF_INTEREST.items():
             if key in lower_name:
-                # Keep the entry with the highest version string
                 if friendly not in detected or _version_key(entry["version"]) > _version_key(detected[friendly]):
                     detected[friendly] = entry["version"]
 
@@ -192,18 +281,37 @@ def check_software_versions() -> List[Dict[str, Any]]:
                     "Automated update status could not be verified."
                 ),
                 "recommendation": (
-                    f"Ensure {friendly} is updated to the latest version. "
-                    "Enable automatic updates where available."
+                    f"Ensure {friendly} is updated to the latest version "
+                    "and auto-updates are enabled."
                 ),
+                "confidence": "Medium",
             })
+
+            min_safe = MIN_SAFE_VERSIONS.get(friendly)
+            if min_safe and _version_tuple(version) < min_safe:
+                min_safe_text = ".".join(str(p) for p in min_safe)
+                findings.append({
+                    "name": f"Outdated Software Version Detected: {friendly} v{version}",
+                    "severity": "Medium",
+                    "description": (
+                        f"{friendly} version {version} is below the recommended baseline "
+                        f"({min_safe_text})."
+                    ),
+                    "recommendation": f"Upgrade {friendly} to at least {min_safe_text}.",
+                    "confidence": "Medium",
+                })
     else:
         findings.append({
             "name": "Installed Software Versions",
             "severity": "Info",
-            "description": "No tracked software (Java, Adobe Reader, VLC, 7-Zip, Chrome, Firefox) detected.",
+            "description": (
+                "No tracked software (Java, Adobe Reader, VLC, 7-Zip, Chrome, Firefox) detected."
+            ),
             "recommendation": "No action required.",
+            "confidence": "High",
         })
 
+    findings.extend(_find_risky_software(installed))
     return findings
 
 

@@ -38,6 +38,13 @@ _BANNER_HINTS = {
     "MySQL": "MySQL",
 }
 
+MAX_DISPLAYED_BANNERS = 50
+
+
+def _is_loopback_addr(addr: str) -> bool:
+    """Return True if an address is a loopback endpoint."""
+    return addr.startswith("127.") or addr in {"::1", "localhost"}
+
 
 def _grab_banner(host: str, port: int, timeout: float = 1.0) -> Optional[str]:
     """Attempt to grab a one-line banner from an open TCP port.
@@ -71,14 +78,19 @@ def _check_port(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> boo
 def _get_listening_interfaces(port: int) -> List[str]:
     """
     Return a list of bind addresses for which the given TCP port is
-    reachable. Checks 127.0.0.1 (loopback) and the machine's non-loopback
-    IPv4 addresses. Returns a list of addresses that accepted a connection.
+    reachable. Checks loopback and local host addresses (IPv4/IPv6 when
+    available). Returns a list of addresses that accepted a connection.
     Never raises.
     """
-    candidates = ["127.0.0.1"]
+    candidates = ["127.0.0.1", "::1"]
     try:
         hostname = socket.gethostname()
-        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+        for info in socket.getaddrinfo(
+            hostname,
+            None,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+        ):
             addr = info[4][0]
             if addr not in candidates:
                 candidates.append(addr)
@@ -93,6 +105,59 @@ def _get_listening_interfaces(port: int) -> List[str]:
         except Exception:
             pass
     return reachable
+
+
+def _listener_binding_summary(
+    open_ports: List[int],
+    interfaces_by_port: Optional[Dict[int, List[str]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Summarize loopback-only vs externally reachable listeners.
+    """
+    if not open_ports:
+        return None
+
+    loopback_only: List[int] = []
+    externally_reachable: List[int] = []
+    unknown: List[int] = []
+
+    for port in open_ports:
+        interfaces = (
+            interfaces_by_port.get(port, [])
+            if interfaces_by_port is not None
+            else _get_listening_interfaces(port)
+        )
+        if not interfaces:
+            unknown.append(port)
+        elif all(_is_loopback_addr(addr) for addr in interfaces):
+            loopback_only.append(port)
+        else:
+            externally_reachable.append(port)
+
+    severity = "Info"
+    if externally_reachable:
+        severity = "Medium"
+
+    details = [
+        f"Externally reachable ports: {', '.join(str(p) for p in externally_reachable) or 'none'}",
+        f"Loopback-only ports: {', '.join(str(p) for p in loopback_only) or 'none'}",
+    ]
+    if unknown:
+        details.append(
+            "Ports with undetermined binding reachability: "
+            + ", ".join(str(p) for p in unknown)
+        )
+
+    return {
+        "name": "Listener Binding Analysis",
+        "severity": severity,
+        "description": "\n".join(details),
+        "recommendation": (
+            "Prefer loopback-only bindings for local-only services, and restrict "
+            "externally reachable listeners with host firewalls and access controls."
+        ),
+        "confidence": "Medium",
+    }
 
 
 def _identify_service(port: int, banner: Optional[str] = None) -> Tuple[str, str]:
@@ -345,6 +410,7 @@ def run_checks(
         open_ports = scan_open_ports(1, 10000)
 
     # Open port summary finding
+    interfaces_by_port: Dict[int, List[str]] = {}
     if open_ports:
         findings.append({
             "name": "Open Ports Detected",
@@ -357,14 +423,49 @@ def run_checks(
             "confidence": "High",
         })
 
+        if progress_callback:
+            progress_callback("Analyzing listener binding exposure…")
+        for port in open_ports:
+            interfaces_by_port[port] = _get_listening_interfaces(port)
+        binding_finding = _listener_binding_summary(open_ports, interfaces_by_port)
+        if binding_finding:
+            findings.append(binding_finding)
+
+        if progress_callback:
+            progress_callback("Collecting service banners from open ports…")
+        banner_entries = []
+        for port in open_ports:
+            banner = _grab_banner("127.0.0.1", port)
+            if banner:
+                service_name, confidence = _identify_service(port, banner)
+                banner_entries.append(
+                    f"Port {port} ({service_name}, confidence={confidence}): {banner}"
+                )
+        if banner_entries:
+            sample = "\n".join(banner_entries[:MAX_DISPLAYED_BANNERS])
+            if len(banner_entries) > MAX_DISPLAYED_BANNERS:
+                sample += f"\n... and {len(banner_entries) - MAX_DISPLAYED_BANNERS} more banner(s)"
+            findings.append({
+                "name": "Service Banner Collection",
+                "severity": "Info",
+                "description": (
+                    f"Collected {len(banner_entries)} banner(s) from open local TCP ports:\n{sample}"
+                ),
+                "recommendation": (
+                    "Review disclosed service metadata and suppress unnecessary banners "
+                    "or version strings where possible."
+                ),
+                "confidence": "Medium",
+            })
+
     # 3. Dangerous services with banner grabbing
     for port in open_ports:
         if port in DANGEROUS_PORTS:
             svc_name, base_severity, svc_desc = DANGEROUS_PORTS[port]
 
             # Check which interfaces the port is reachable on
-            interfaces = _get_listening_interfaces(port)
-            is_loopback_only = all(a.startswith("127.") for a in interfaces)
+            interfaces = interfaces_by_port.get(port, _get_listening_interfaces(port))
+            is_loopback_only = all(_is_loopback_addr(a) for a in interfaces)
 
             # Attempt banner grab for confirmation
             banner = _grab_banner("127.0.0.1", port)
