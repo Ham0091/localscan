@@ -43,9 +43,11 @@ def normalize_finding(finding: Any, module_name: str = "unknown") -> Dict[str, A
         out["_original_confidence"] = out["confidence"]
         out["confidence"] = "Medium"
 
-    return {k: out[k] for k in REQUIRED_KEYS} | {
-        k: v for k, v in out.items() if k not in REQUIRED_KEYS
-    }
+    normalized: Dict[str, Any] = {k: out[k] for k in REQUIRED_KEYS}
+    for key, value in out.items():
+        if key not in normalized:
+            normalized[key] = value
+    return normalized
 
 
 def normalize_findings(findings: Iterable[Any], module_name: str) -> List[Dict[str, Any]]:

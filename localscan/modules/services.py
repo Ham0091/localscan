@@ -145,7 +145,11 @@ def _get_installed_software_windows() -> List[Dict[str, str]]:
 
 
 def _version_key(v: str):
-    """Parse a version string into a list of ints for comparison."""
+    """Parse a version string into numeric components for coarse comparison.
+
+    Non-numeric labels (e.g., beta/rc) are ignored to keep parsing resilient
+    across inconsistent vendor version formats.
+    """
     try:
         nums = [int(x) for x in re.findall(r"\d+", v or "")]
         return nums if nums else [0]

@@ -38,6 +38,13 @@ _BANNER_HINTS = {
     "MySQL": "MySQL",
 }
 
+BANNER_SAMPLE_LIMIT = 50
+
+
+def _is_loopback_addr(addr: str) -> bool:
+    """Return True if an address is a loopback endpoint."""
+    return addr.startswith("127.") or addr in {"::1", "localhost"}
+
 
 def _grab_banner(host: str, port: int, timeout: float = 1.0) -> Optional[str]:
     """Attempt to grab a one-line banner from an open TCP port.
@@ -71,14 +78,19 @@ def _check_port(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> boo
 def _get_listening_interfaces(port: int) -> List[str]:
     """
     Return a list of bind addresses for which the given TCP port is
-    reachable. Checks 127.0.0.1 (loopback) and the machine's non-loopback
-    IPv4 addresses. Returns a list of addresses that accepted a connection.
+    reachable. Checks loopback and local host addresses (IPv4/IPv6 when
+    available). Returns a list of addresses that accepted a connection.
     Never raises.
     """
-    candidates = ["127.0.0.1"]
+    candidates = ["127.0.0.1", "::1"]
     try:
         hostname = socket.gethostname()
-        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+        for info in socket.getaddrinfo(
+            hostname,
+            None,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+        ):
             addr = info[4][0]
             if addr not in candidates:
                 candidates.append(addr)
@@ -117,7 +129,7 @@ def _listener_binding_summary(
         )
         if not interfaces:
             unknown.append(port)
-        elif all(addr.startswith("127.") for addr in interfaces):
+        elif all(_is_loopback_addr(addr) for addr in interfaces):
             loopback_only.append(port)
         else:
             externally_reachable.append(port)
@@ -430,9 +442,9 @@ def run_checks(
                     f"Port {port} ({service_name}, confidence={confidence}): {banner}"
                 )
         if banner_entries:
-            sample = "\n".join(banner_entries[:50])
-            if len(banner_entries) > 50:
-                sample += f"\n... and {len(banner_entries) - 50} more banner(s)"
+            sample = "\n".join(banner_entries[:BANNER_SAMPLE_LIMIT])
+            if len(banner_entries) > BANNER_SAMPLE_LIMIT:
+                sample += f"\n... and {len(banner_entries) - BANNER_SAMPLE_LIMIT} more banner(s)"
             findings.append({
                 "name": "Service Banner Collection",
                 "severity": "Info",
@@ -453,7 +465,7 @@ def run_checks(
 
             # Check which interfaces the port is reachable on
             interfaces = interfaces_by_port.get(port, _get_listening_interfaces(port))
-            is_loopback_only = all(a.startswith("127.") for a in interfaces)
+            is_loopback_only = all(_is_loopback_addr(a) for a in interfaces)
 
             # Attempt banner grab for confirmation
             banner = _grab_banner("127.0.0.1", port)
